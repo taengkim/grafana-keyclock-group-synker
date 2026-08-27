@@ -51,8 +51,8 @@ def kc_user(email, username=None, enabled=True):
     return {"id": f"kc-{username}", "username": username, "email": email, "enabled": enabled}
 
 
-def gf_member(user_id, email, login=None):
-    return {"userId": user_id, "email": email, "login": login or email.split("@")[0]}
+def gf_member(user_id, email, login=None, permission=0):
+    return {"userId": user_id, "email": email, "login": login or email.split("@")[0], "permission": permission}
 
 
 def add_token_endpoint():
@@ -211,31 +211,103 @@ def test_removal_ratio_guard_skips_team_and_exits_1(caplog):
 
 
 @responses.activate
-def test_subgroup_becomes_its_own_team():
+def test_admin_subgroup_grants_team_admin_permission():
     add_token_endpoint()
     responses.add(responses.GET, f"{ADMIN}/groups", json=[{"id": "g1", "name": "grafana-platform"}])
     responses.add(
         responses.GET, f"{ADMIN}/groups/g1/children",
-        json=[{"id": "g2", "name": "grafana-platform-oncall"}],
+        json=[{"id": "g2", "name": "admin"}],
     )
-    responses.add(responses.GET, f"{ADMIN}/groups/g2/children", json=[])
-    add_members("g1", [kc_user("alice@example.com")])
-    add_members("g2", [kc_user("bob@example.com")])  # not inherited by the parent team
+    add_members("g1", [kc_user("alice@example.com")])  # depth 1: plain member
+    add_members("g2", [kc_user("bob@example.com")])    # depth 2 "admin": team Admin
     add_team_search("platform")
-    add_team_search("platform-oncall")
-    created = responses.add(responses.POST, f"{GF}/api/teams", json={"teamId": 7, "message": "Team created"})
+    responses.add(responses.POST, f"{GF}/api/teams", json={"teamId": 7, "message": "Team created"})
     add_lookup("alice@example.com", user_id=101)
     add_lookup("bob@example.com", user_id=102)
-    responses.add(responses.POST, f"{GF}/api/teams/7/members", json={"message": "Member added"})
+    added = responses.add(responses.POST, f"{GF}/api/teams/7/members", json={"message": "Member added"})
+    perm_put = responses.add(responses.PUT, f"{GF}/api/teams/7/members/102", json={"message": "Permission updated"})
 
     assert sync.run_sync(make_config()) == 0
-    assert created.call_count == 2
-    created_names = {
-        json.loads(c.request.body)["name"]
-        for c in responses.calls
-        if c.request.method == "POST" and c.request.url == f"{GF}/api/teams"
-    }
-    assert created_names == {"platform", "platform-oncall"}
+    assert added.call_count == 2
+    bodies = [json.loads(c.request.body) for c in responses.calls
+              if c.request.method == "POST" and c.request.url == f"{GF}/api/teams/7/members"]
+    assert {"userId": 101} in bodies
+    assert {"userId": 102, "permission": 4} in bodies
+    # Admin permission also enforced via PUT for older Grafana versions
+    assert perm_put.call_count == 1
+    assert json.loads(perm_put.calls[0].request.body) == {"permission": 4}
+
+
+@responses.activate
+def test_permission_change_of_existing_members():
+    add_token_endpoint()
+    responses.add(responses.GET, f"{ADMIN}/groups", json=[{"id": "g1", "name": "grafana-devs"}])
+    responses.add(
+        responses.GET, f"{ADMIN}/groups/g1/children",
+        json=[{"id": "g2", "name": "member"}, {"id": "g3", "name": "admin"}],
+    )
+    add_members("g1", [])
+    add_members("g2", [kc_user("bob@example.com")])    # demoted: was Admin in Grafana
+    add_members("g3", [kc_user("alice@example.com")])  # promoted: was Member in Grafana
+    add_team_search("devs", {"id": 7, "name": "devs"})
+    responses.add(
+        responses.GET, f"{GF}/api/teams/7/members",
+        json=[
+            gf_member(101, "alice@example.com", permission=0),
+            gf_member(102, "bob@example.com", permission=4),
+        ],
+    )
+    put_alice = responses.add(responses.PUT, f"{GF}/api/teams/7/members/101", json={"message": "Permission updated"})
+    put_bob = responses.add(responses.PUT, f"{GF}/api/teams/7/members/102", json={"message": "Permission updated"})
+
+    assert sync.run_sync(make_config()) == 0
+    assert put_alice.call_count == 1
+    assert json.loads(put_alice.calls[0].request.body) == {"permission": 4}
+    assert put_bob.call_count == 1
+    assert json.loads(put_bob.calls[0].request.body) == {"permission": 0}
+    # No adds or removals, only permission updates
+    assert not [c for c in responses.calls if c.request.method == "DELETE"]
+    assert not [c for c in responses.calls if c.request.method == "POST" and c.request.url.startswith(f"{GF}/api/teams")]
+
+
+@responses.activate
+def test_admin_wins_when_user_in_both_permission_groups():
+    add_token_endpoint()
+    responses.add(responses.GET, f"{ADMIN}/groups", json=[{"id": "g1", "name": "grafana-devs"}])
+    responses.add(
+        responses.GET, f"{ADMIN}/groups/g1/children",
+        json=[{"id": "g2", "name": "member"}, {"id": "g3", "name": "admin"}],
+    )
+    add_members("g1", [kc_user("alice@example.com")])
+    add_members("g2", [kc_user("alice@example.com")])
+    add_members("g3", [kc_user("alice@example.com")])
+    add_team_search("devs", {"id": 7, "name": "devs"})
+    responses.add(
+        responses.GET, f"{GF}/api/teams/7/members",
+        json=[gf_member(101, "alice@example.com", permission=4)],
+    )
+
+    assert sync.run_sync(make_config()) == 0
+    assert not grafana_write_calls()
+
+
+@responses.activate
+def test_unknown_permission_subgroup_is_skipped(caplog):
+    add_token_endpoint()
+    responses.add(responses.GET, f"{ADMIN}/groups", json=[{"id": "g1", "name": "grafana-devs"}])
+    responses.add(
+        responses.GET, f"{ADMIN}/groups/g1/children",
+        json=[{"id": "g2", "name": "leads"}],
+    )
+    add_members("g1", [kc_user("alice@example.com")])
+    add_team_search("devs", {"id": 7, "name": "devs"})
+    responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[gf_member(101, "alice@example.com")])
+
+    assert sync.run_sync(make_config()) == 0
+    assert "unknown_permission_group_skipped" in caplog.text
+    # Members of the unknown sub-group were never even fetched
+    assert not [c for c in responses.calls if "/groups/g2/members" in c.request.url]
+    assert not grafana_write_calls()
 
 
 @responses.activate
@@ -245,19 +317,24 @@ def test_subgroups_fallback_for_old_keycloak():
         responses.GET, f"{ADMIN}/groups",
         json=[{
             "id": "g1", "name": "grafana-devs",
-            "subGroups": [{"id": "g2", "name": "grafana-devs-leads", "subGroups": []}],
+            "subGroups": [{"id": "g2", "name": "admin", "subGroups": []}],
         }],
     )
     # Old Keycloak: /children does not exist
     responses.add(responses.GET, f"{ADMIN}/groups/g1/children", status=404, json={"error": "unknown_error"})
-    add_members("g1", [])
-    add_members("g2", [])
+    add_members("g1", [kc_user("alice@example.com")])
+    add_members("g2", [kc_user("bob@example.com")])
     add_team_search("devs", {"id": 7, "name": "devs"})
-    add_team_search("devs-leads", {"id": 8, "name": "devs-leads"})
-    responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[])
-    responses.add(responses.GET, f"{GF}/api/teams/8/members", json=[])
+    responses.add(
+        responses.GET, f"{GF}/api/teams/7/members",
+        json=[
+            gf_member(101, "alice@example.com", permission=0),
+            gf_member(102, "bob@example.com", permission=4),
+        ],
+    )
 
     assert sync.run_sync(make_config()) == 0
+    assert not grafana_write_calls()
 
 
 @responses.activate
@@ -290,11 +367,17 @@ def test_member_pagination_over_multiple_pages():
 @responses.activate
 def test_dry_run_makes_no_write_calls(caplog):
     add_token_endpoint()
-    add_groups([{"id": "g1", "name": "grafana-devs"}, {"id": "g2", "name": "grafana-new"}])
+    responses.add(responses.GET, f"{ADMIN}/groups", json=[{"id": "g1", "name": "grafana-devs"}, {"id": "g2", "name": "grafana-new"}])
+    responses.add(responses.GET, f"{ADMIN}/groups/g1/children", json=[{"id": "g3", "name": "admin"}])
+    responses.add(responses.GET, f"{ADMIN}/groups/g2/children", json=[])
     add_members("g1", [kc_user("carol@example.com")])
+    add_members("g3", [kc_user("bob@example.com")])  # bob would be promoted to Admin
     add_members("g2", [kc_user("alice@example.com")])
     add_team_search("devs", {"id": 7, "name": "devs"})
-    responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[gf_member(102, "bob@example.com"), gf_member(101, "old@example.com")])
+    responses.add(
+        responses.GET, f"{GF}/api/teams/7/members",
+        json=[gf_member(102, "bob@example.com", permission=0), gf_member(101, "old@example.com")],
+    )
     add_team_search("new")  # would need to be created
     add_lookup("carol@example.com", user_id=103)
     add_lookup("alice@example.com", user_id=101)
@@ -303,6 +386,7 @@ def test_dry_run_makes_no_write_calls(caplog):
     assert not grafana_write_calls()
     assert "would_create_team" in caplog.text
     assert "would_add_member" in caplog.text
+    assert "would_update_permission" in caplog.text
     assert "would_remove_member" in caplog.text
 
 

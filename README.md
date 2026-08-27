@@ -3,16 +3,35 @@
 Keycloak 그룹 멤버십을 Grafana OSS 팀 멤버십에 주기적으로 반영하는 멱등 동기화 잡입니다.
 Grafana Enterprise 의 Team Sync 를 대체하며, Kubernetes CronJob 으로 10분마다 실행합니다.
 
+## 그룹 구조
+
+`GROUP_PREFIX`(기본 `grafana-`)로 시작하는 그룹이 **팀**이고,
+그 **하위 그룹 이름이 팀 내 권한**입니다.
+
+```
+grafana-devs            → 팀 "devs" (직속 멤버는 Member 권한)
+├── member              → 팀 "devs" 의 Member
+└── admin               → 팀 "devs" 의 Admin (팀 관리자)
+```
+
+- 하위 그룹 이름은 `member` / `admin` 만 인식합니다 (대소문자 무관).
+  다른 이름의 하위 그룹은 경고 로그를 남기고 건너뜁니다.
+- 팀 그룹의 직속 멤버는 Member 로 취급합니다. 한 사용자가 `member` 와 `admin`
+  양쪽에 있으면 Admin 이 우선합니다.
+- 여기서 말하는 권한은 Grafana **팀 멤버 권한**(Member/Admin)입니다.
+  org 롤(Viewer/Editor/Admin)은 기존대로 `role_attribute_path` 가 담당합니다.
+
 ## 동작 방식
 
-1. Keycloak 에서 전체 그룹 트리를 조회하고 `GROUP_PREFIX`(기본 `grafana-`)로 시작하는
-   그룹만 관리 대상으로 선별합니다. 팀 이름은 그룹 이름에서 prefix 를 제거한 값입니다.
-   - 하위 그룹은 **독립 팀**으로 취급하며, 상위 그룹으로 멤버를 상속하지 않습니다.
+1. Keycloak 그룹 트리에서 prefix 그룹(팀)을 찾습니다. 팀 이름은 그룹 이름에서
+   prefix 를 제거한 값입니다.
    - Keycloak 23+ 의 `/groups/{id}/children` 엔드포인트를 사용하고,
      구버전에서는 `subGroups` 필드로 자동 fallback 합니다.
-2. 각 그룹의 직속 멤버(비활성 사용자 제외)를 `MATCH_KEY`(`email` 기본 또는 `username`)로
-   Grafana 사용자와 매칭합니다. 비교는 소문자 정규화 후 수행합니다.
-3. Grafana 에 팀이 없으면 생성하고, 현재 팀 멤버와 비교해 추가/제거합니다.
+2. 팀 그룹의 직속 멤버와 권한 하위 그룹 멤버(비활성 사용자 제외)를
+   `MATCH_KEY`(`email` 기본 또는 `username`)로 Grafana 사용자와 매칭합니다.
+   비교는 소문자 정규화 후 수행합니다.
+3. Grafana 에 팀이 없으면 생성하고, 현재 팀 멤버와 비교해 추가/제거하며,
+   권한이 다른 기존 멤버는 권한을 갱신합니다.
    - 아직 Grafana 에 로그인한 적 없는 사용자(lookup 404)는 건너뛰고 pending 으로
      집계하며, 다음 주기에 자동 재시도됩니다.
    - prefix 밖의 팀은 조회조차 하지 않으므로 절대 변경되지 않습니다.
@@ -121,8 +140,9 @@ kubectl create secret generic grafana-team-sync \
 한 줄 단위 logfmt 스타일 구조화 로그입니다.
 
 ```
-time=2026-08-27T09:00:01+0000 level=INFO event=add_member team=devs target=alice@example.com
-time=2026-08-27T09:00:02+0000 level=INFO event=sync_complete teams=3 failed_teams=0 added=2 removed=1 pending_first_login=1 dry_run=False exit_code=0
+time=2026-08-27T09:00:01+0000 level=INFO event=add_member team=devs target=alice@example.com permission=Member
+time=2026-08-27T09:00:01+0000 level=INFO event=update_permission team=devs target=bob@example.com permission=Admin
+time=2026-08-27T09:00:02+0000 level=INFO event=sync_complete teams=3 failed_teams=0 added=2 removed=1 permission_updates=1 pending_first_login=1 dry_run=False exit_code=0
 ```
 
 ## 개발
@@ -133,4 +153,5 @@ python -m pytest tests/ -v
 ```
 
 테스트는 `responses` 로 Keycloak/Grafana API 를 모킹하며, 팀 생성·멤버 추가/제거,
-페이지네이션, 하위 그룹, 제거 가드, dry-run 무변경, 토큰 재발급 등을 커버합니다.
+권한(admin/member) 하위 그룹과 권한 갱신, 페이지네이션, 제거 가드, dry-run 무변경,
+토큰 재발급 등을 커버합니다.
