@@ -15,9 +15,18 @@ service                 ← GROUP_PREFIX 와 매칭되는 루트 그룹
     └── abc_adm         → 팀 "abc" 의 Admin (팀 관리자)
 ```
 
-- 권한 그룹 이름은 `<팀명>_adm`, `<팀명>_admin`, `<팀명>_member`, `<팀명>_mbr`
-  형태를 인식합니다 (`_` 대신 `-` 도 허용, 팀명 없이 `admin`/`member` 도 허용,
-  대소문자 무관). 그 외 이름의 하위 그룹은 경고 로그를 남기고 건너뜁니다.
+- 권한 그룹 이름 → 권한 매핑은 `PERMISSION_MAP` 환경변수로 정의합니다.
+  형식은 `<suffix>=<admin|member>` 쌍의 콤마 구분 목록입니다.
+
+  ```sh
+  # 예: abc_adm → Admin, abc_mbr → Member
+  PERMISSION_MAP="adm=admin,mbr=member"
+  ```
+
+  suffix 는 `<팀명>_<suffix>`, `<팀명>-<suffix>`, 또는 suffix 단독 이름과
+  매칭됩니다 (대소문자 무관). 미설정 시 기본값은
+  `adm=admin,admin=admin,member=member,mbr=member,mem=member` 입니다.
+  매핑에 없는 이름의 하위 그룹은 경고 로그를 남기고 건너뜁니다.
 - 팀 그룹의 직속 멤버는 Member 로 취급합니다. 한 사용자가 member 와 admin
   양쪽에 있으면 Admin 이 우선합니다.
 - 여기서 말하는 권한은 Grafana **팀 멤버 권한**(Member/Admin)입니다.
@@ -75,6 +84,7 @@ service                 ← GROUP_PREFIX 와 매칭되는 루트 그룹
 | `GRAFANA_TOKEN` | Y | | 서비스 계정 토큰 — K8s Secret 으로 주입 |
 | `GROUP_PREFIX` | N | `grafana-` | 루트 그룹 이름 prefix (예: `service`) |
 | `MATCH_KEY` | N | `email` | `email` 또는 `username`. Grafana `login_attribute_path` 와 일치해야 함 |
+| `PERMISSION_MAP` | N | `adm=admin,admin=admin,member=member,mbr=member,mem=member` | 권한 그룹 suffix → 팀 권한 매핑. `<suffix>=<admin\|member>` 콤마 구분 |
 | `DRY_RUN` | N | `true` | 변경 없이 로그만 출력 |
 | `MAX_REMOVAL_RATIO` | N | `0.5` | 팀별 제거 가드 임계값 (0~1) |
 | `LOG_LEVEL` | N | `INFO` | |

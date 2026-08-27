@@ -20,7 +20,7 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import requests
 
@@ -41,9 +41,10 @@ EXIT_CONFIG = 2
 PERMISSION_MEMBER = 0
 PERMISSION_ADMIN = 4
 PERMISSION_LABELS = {PERMISSION_MEMBER: "Member", PERMISSION_ADMIN: "Admin"}
-# Permission-group name (after stripping an optional "<team>_"/"<team>-"
-# prefix, e.g. "abc_adm" for team "abc") -> team permission
-PERMISSION_ALIASES = {
+# Default permission-group name (after stripping an optional
+# "<team>_"/"<team>-" prefix, e.g. "abc_adm" for team "abc") -> team
+# permission. Overridable via the PERMISSION_MAP environment variable.
+DEFAULT_PERMISSION_MAP = {
     "admin": PERMISSION_ADMIN,
     "adm": PERMISSION_ADMIN,
     "member": PERMISSION_MEMBER,
@@ -52,10 +53,38 @@ PERMISSION_ALIASES = {
 }
 
 
-def child_permission(team_name: str, child_name: str) -> int | None:
+def parse_permission_map(raw: str) -> dict[str, int]:
+    """Parse PERMISSION_MAP: comma-separated "<suffix>=<admin|member>" pairs.
+
+    Example: "adm=admin,mgr=admin,dev=member"
+    """
+    mapping: dict[str, int] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if "=" not in pair:
+            raise ConfigError(f"PERMISSION_MAP entry {pair!r} must be '<suffix>=<admin|member>'")
+        suffix, _, permission = pair.partition("=")
+        suffix = suffix.strip().lower()
+        permission = permission.strip().lower()
+        if not suffix:
+            raise ConfigError(f"PERMISSION_MAP entry {pair!r} has an empty group-name suffix")
+        if permission not in ("admin", "member"):
+            raise ConfigError(
+                f"PERMISSION_MAP entry {pair!r}: permission must be 'admin' or 'member', got {permission!r}"
+            )
+        mapping[suffix] = PERMISSION_ADMIN if permission == "admin" else PERMISSION_MEMBER
+    if not mapping:
+        raise ConfigError("PERMISSION_MAP must contain at least one '<suffix>=<admin|member>' pair")
+    return mapping
+
+
+def child_permission(team_name: str, child_name: str, permission_map: dict[str, int]) -> int | None:
     """Team permission encoded in a permission-group name, or None.
 
-    Accepts "<team>_adm", "<team>-adm", or a bare alias like "admin".
+    Matches the mapped name as "<team>_<name>", "<team>-<name>", or bare
+    "<name>" (e.g. "abc_adm", "abc-adm", "adm"), case-insensitive.
     """
     name = child_name.strip().lower()
     team = team_name.strip().lower()
@@ -64,7 +93,7 @@ def child_permission(team_name: str, child_name: str) -> int | None:
         if name.startswith(prefixed):
             name = name[len(prefixed):]
             break
-    return PERMISSION_ALIASES.get(name)
+    return permission_map.get(name)
 
 RETRYABLE_EXCEPTIONS = (
     requests.exceptions.ConnectionError,
@@ -133,6 +162,7 @@ class Config:
     dry_run: bool = True
     max_removal_ratio: float = 0.5
     log_level: str = "INFO"
+    permission_map: dict = field(default_factory=lambda: dict(DEFAULT_PERMISSION_MAP))
 
     REQUIRED = (
         "KEYCLOAK_URL",
@@ -165,6 +195,9 @@ class Config:
         if not 0.0 <= max_removal_ratio <= 1.0:
             raise ConfigError(f"MAX_REMOVAL_RATIO must be between 0 and 1, got {raw_ratio!r}")
 
+        raw_permission_map = env.get("PERMISSION_MAP", "")
+        permission_map = parse_permission_map(raw_permission_map) if raw_permission_map.strip() else dict(DEFAULT_PERMISSION_MAP)
+
         return cls(
             keycloak_url=env["KEYCLOAK_URL"].rstrip("/"),
             keycloak_realm=env["KEYCLOAK_REALM"],
@@ -177,6 +210,7 @@ class Config:
             dry_run=parse_bool(env.get("DRY_RUN", "true"), "DRY_RUN"),
             max_removal_ratio=max_removal_ratio,
             log_level=env.get("LOG_LEVEL", "INFO"),
+            permission_map=permission_map,
         )
 
 
@@ -438,12 +472,12 @@ def desired_members(cfg: Config, kc: KeycloakClient, team_name: str, groups: lis
     for team_group in groups:
         ingest(team_group, PERMISSION_MEMBER)
         for child in kc.get_children(team_group):
-            permission = child_permission(team_name, child.get("name", ""))
+            permission = child_permission(team_name, child.get("name", ""), cfg.permission_map)
             if permission is None:
                 log_event(
                     logging.WARNING, "unknown_permission_group_skipped",
                     team=team_name, group=child.get("name", ""),
-                    expected=f"{team_name}_adm|{team_name}_member|admin|member",
+                    expected="|".join(f"{team_name}_{suffix}" for suffix in sorted(cfg.permission_map)),
                 )
                 continue
             ingest(child, permission)

@@ -538,7 +538,72 @@ def test_config_invalid_match_key():
     ("abc", "xyz_adm", None),
 ])
 def test_child_permission_parsing(team, child, expected):
-    assert sync.child_permission(team, child) == expected
+    assert sync.child_permission(team, child, sync.DEFAULT_PERMISSION_MAP) == expected
+
+
+@responses.activate
+def test_custom_permission_map():
+    """PERMISSION_MAP lets users map their own suffixes, e.g. abc_mgr -> Admin."""
+    add_token_endpoint()
+    add_tree([{"id": "g1", "name": "abc"}], empty_team_children=False)
+    add_children("g1", [{"id": "g2", "name": "abc_mgr"}, {"id": "g3", "name": "abc_dev"}])
+    add_members("g1", [])
+    add_members("g2", [kc_user("alice@example.com")])  # abc_mgr -> Admin
+    add_members("g3", [kc_user("bob@example.com")])    # abc_dev -> Member
+    add_team_search("abc", {"id": 7, "name": "abc"})
+    responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[])
+    add_lookup("alice@example.com", user_id=101)
+    add_lookup("bob@example.com", user_id=102)
+    added = responses.add(responses.POST, f"{GF}/api/teams/7/members", json={"message": "Member added"})
+    responses.add(responses.PUT, f"{GF}/api/teams/7/members/101", json={"message": "Permission updated"})
+
+    cfg = make_config(permission_map={"mgr": sync.PERMISSION_ADMIN, "dev": sync.PERMISSION_MEMBER})
+    assert sync.run_sync(cfg) == 0
+    bodies = [json.loads(c.request.body) for c in responses.calls
+              if c.request.method == "POST" and c.request.url == f"{GF}/api/teams/7/members"]
+    assert {"userId": 101, "permission": 4} in bodies
+    assert {"userId": 102} in bodies
+    assert added.call_count == 2
+
+
+def test_config_parses_permission_map():
+    cfg = sync.Config.from_env({
+        "KEYCLOAK_URL": KC,
+        "KEYCLOAK_REALM": REALM,
+        "KEYCLOAK_CLIENT_ID": "grafana-sync",
+        "KEYCLOAK_CLIENT_SECRET": "secret",
+        "GRAFANA_URL": GF,
+        "GRAFANA_TOKEN": "gf-token",
+        "PERMISSION_MAP": "adm=admin, MGR = Admin ,dev=member",
+    })
+    assert cfg.permission_map == {
+        "adm": sync.PERMISSION_ADMIN,
+        "mgr": sync.PERMISSION_ADMIN,
+        "dev": sync.PERMISSION_MEMBER,
+    }
+
+
+def test_config_permission_map_defaults_when_unset():
+    cfg = sync.Config.from_env({
+        "KEYCLOAK_URL": KC,
+        "KEYCLOAK_REALM": REALM,
+        "KEYCLOAK_CLIENT_ID": "grafana-sync",
+        "KEYCLOAK_CLIENT_SECRET": "secret",
+        "GRAFANA_URL": GF,
+        "GRAFANA_TOKEN": "gf-token",
+    })
+    assert cfg.permission_map == sync.DEFAULT_PERMISSION_MAP
+
+
+@pytest.mark.parametrize("raw", [
+    "adm=root",       # unknown permission value
+    "adm",            # missing '='
+    "=admin",         # empty suffix
+    "   ,  ",         # no pairs at all
+])
+def test_config_invalid_permission_map(raw):
+    with pytest.raises(sync.ConfigError):
+        sync.parse_permission_map(raw)
 
 
 @responses.activate

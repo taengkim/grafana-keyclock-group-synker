@@ -53,6 +53,11 @@ spec:
                   value: "grafana-"
                 - name: MATCH_KEY
                   value: "email"
+                # Permission-group suffix -> team permission mapping.
+                # Omit to use the built-in defaults (adm/admin -> Admin,
+                # member/mbr/mem -> Member).
+                - name: PERMISSION_MAP
+                  value: "adm=admin,member=member"
                 # DRY_RUN defaults to true in the script; production must opt in
                 # explicitly. Flip to "true" here to preview changes safely.
                 - name: DRY_RUN
