@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Sync Keycloak group memberships to Grafana teams.
 
-Groups whose name starts with GROUP_PREFIX are mirrored to Grafana teams
-(team name = group name without the prefix). Sub-groups of a team group
-map to the Grafana team permission of their members: a child named
-"admin" grants team Admin, "member" (and direct membership in the team
-group itself) grants plain membership. Only team membership is managed
-here; org roles stay with Grafana's role_attribute_path mapping.
+Groups whose name starts with GROUP_PREFIX are root groups. One depth
+below a root group are the teams; one depth below a team are its
+permission groups, e.g. /service/abc/abc_adm with GROUP_PREFIX=service
+maps to Grafana team "abc" with the members of "abc_adm" as team
+Admins. Direct members of the team group itself are plain Members.
+Only team membership is managed here; org roles stay with Grafana's
+role_attribute_path mapping.
 
 Exit codes:
     0 - success
@@ -40,8 +41,30 @@ EXIT_CONFIG = 2
 PERMISSION_MEMBER = 0
 PERMISSION_ADMIN = 4
 PERMISSION_LABELS = {PERMISSION_MEMBER: "Member", PERMISSION_ADMIN: "Admin"}
-# Sub-group name (depth 2, under a team group) -> team permission
-PERMISSION_GROUP_NAMES = {"member": PERMISSION_MEMBER, "admin": PERMISSION_ADMIN}
+# Permission-group name (after stripping an optional "<team>_"/"<team>-"
+# prefix, e.g. "abc_adm" for team "abc") -> team permission
+PERMISSION_ALIASES = {
+    "admin": PERMISSION_ADMIN,
+    "adm": PERMISSION_ADMIN,
+    "member": PERMISSION_MEMBER,
+    "mbr": PERMISSION_MEMBER,
+    "mem": PERMISSION_MEMBER,
+}
+
+
+def child_permission(team_name: str, child_name: str) -> int | None:
+    """Team permission encoded in a permission-group name, or None.
+
+    Accepts "<team>_adm", "<team>-adm", or a bare alias like "admin".
+    """
+    name = child_name.strip().lower()
+    team = team_name.strip().lower()
+    for separator in ("_", "-"):
+        prefixed = f"{team}{separator}"
+        if name.startswith(prefixed):
+            name = name[len(prefixed):]
+            break
+    return PERMISSION_ALIASES.get(name)
 
 RETRYABLE_EXCEPTIONS = (
     requests.exceptions.ConnectionError,
@@ -291,21 +314,21 @@ class KeycloakClient:
                 return children
             first += PAGE_SIZE
 
-    def collect_team_groups(self, prefix: str) -> list[dict]:
+    def collect_root_groups(self, prefix: str) -> list[dict]:
         """Groups whose name starts with the prefix, anywhere in the tree.
 
-        Does not descend INTO a matched team group: its children are
-        permission groups, handled separately by the sync.
+        Does not descend INTO a matched root group: its children are
+        teams, handled separately by the sync.
         """
-        teams: list[dict] = []
+        roots: list[dict] = []
         queue = list(self.get_top_level_groups())
         while queue:
             group = queue.pop(0)
             if group.get("name", "").startswith(prefix):
-                teams.append(group)
+                roots.append(group)
             else:
                 queue.extend(self.get_children(group))
-        return teams
+        return roots
 
     def get_group_members(self, group_id: str) -> list[dict]:
         """Direct members of a group (Keycloak does not include sub-group members)."""
@@ -391,8 +414,9 @@ class TeamResult:
 def desired_members(cfg: Config, kc: KeycloakClient, team_name: str, groups: list[dict]) -> dict[str, int]:
     """Desired team membership as {match key: team permission}.
 
-    Direct members of the team group get Member; members of a "member" /
-    "admin" sub-group get that permission (admin wins on conflict).
+    Direct members of the team group get Member; members of a permission
+    sub-group (e.g. "<team>_adm") get that permission (admin wins on
+    conflict).
     """
     desired: dict[str, int] = {}
 
@@ -414,12 +438,12 @@ def desired_members(cfg: Config, kc: KeycloakClient, team_name: str, groups: lis
     for team_group in groups:
         ingest(team_group, PERMISSION_MEMBER)
         for child in kc.get_children(team_group):
-            permission = PERMISSION_GROUP_NAMES.get(child.get("name", "").strip().lower())
+            permission = child_permission(team_name, child.get("name", ""))
             if permission is None:
                 log_event(
                     logging.WARNING, "unknown_permission_group_skipped",
                     team=team_name, group=child.get("name", ""),
-                    expected="member|admin",
+                    expected=f"{team_name}_adm|{team_name}_member|admin|member",
                 )
                 continue
             ingest(child, permission)
@@ -523,24 +547,26 @@ def run_sync(cfg: Config, kc: KeycloakClient | None = None, gf: GrafanaClient | 
     if cfg.dry_run:
         log_event(logging.INFO, "dry_run_enabled")
 
-    managed = kc.collect_team_groups(cfg.group_prefix)
-    if not managed:
+    roots = kc.collect_root_groups(cfg.group_prefix)
+
+    # Teams are the children of a root group; same-named teams under
+    # multiple roots are merged. Each team group's children are its
+    # permission groups.
+    teams: dict[str, list[dict]] = {}
+    for root in roots:
+        for team_group in kc.get_children(root):
+            team_name = team_group.get("name", "").strip()
+            if not team_name:
+                continue
+            teams.setdefault(team_name, []).append(team_group)
+
+    if not teams:
         log_event(
             logging.WARNING, "no_managed_groups",
             prefix=cfg.group_prefix,
-            detail="no Keycloak groups match the prefix; nothing changed",
+            detail="no team groups found under root groups matching the prefix; nothing changed",
         )
         return EXIT_OK
-
-    # Groups mapping to the same team name (after prefix strip) are merged;
-    # each team group's children are its permission groups.
-    teams: dict[str, list[dict]] = {}
-    for group in managed:
-        team_name = group["name"][len(cfg.group_prefix):]
-        if not team_name:
-            log_event(logging.WARNING, "group_name_equals_prefix_skipped", group=group["name"])
-            continue
-        teams.setdefault(team_name, []).append(group)
 
     exit_code = EXIT_OK
     total = TeamResult()

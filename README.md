@@ -5,26 +5,28 @@ Grafana Enterprise 의 Team Sync 를 대체하며, Kubernetes CronJob 으로 10�
 
 ## 그룹 구조
 
-`GROUP_PREFIX`(기본 `grafana-`)로 시작하는 그룹이 **팀**이고,
-그 **하위 그룹 이름이 팀 내 권한**입니다.
+`GROUP_PREFIX`(예: `service`)로 시작하는 그룹이 **루트 그룹**이고,
+루트의 **1뎁스 하위가 팀**, 그 **다음 뎁스가 권한 그룹**입니다.
 
 ```
-grafana-devs            → 팀 "devs" (직속 멤버는 Member 권한)
-├── member              → 팀 "devs" 의 Member
-└── admin               → 팀 "devs" 의 Admin (팀 관리자)
+service                 ← GROUP_PREFIX 와 매칭되는 루트 그룹
+└── abc                 → Grafana 팀 "abc" (직속 멤버는 Member 권한)
+    ├── abc_member      → 팀 "abc" 의 Member
+    └── abc_adm         → 팀 "abc" 의 Admin (팀 관리자)
 ```
 
-- 하위 그룹 이름은 `member` / `admin` 만 인식합니다 (대소문자 무관).
-  다른 이름의 하위 그룹은 경고 로그를 남기고 건너뜁니다.
-- 팀 그룹의 직속 멤버는 Member 로 취급합니다. 한 사용자가 `member` 와 `admin`
+- 권한 그룹 이름은 `<팀명>_adm`, `<팀명>_admin`, `<팀명>_member`, `<팀명>_mbr`
+  형태를 인식합니다 (`_` 대신 `-` 도 허용, 팀명 없이 `admin`/`member` 도 허용,
+  대소문자 무관). 그 외 이름의 하위 그룹은 경고 로그를 남기고 건너뜁니다.
+- 팀 그룹의 직속 멤버는 Member 로 취급합니다. 한 사용자가 member 와 admin
   양쪽에 있으면 Admin 이 우선합니다.
 - 여기서 말하는 권한은 Grafana **팀 멤버 권한**(Member/Admin)입니다.
   org 롤(Viewer/Editor/Admin)은 기존대로 `role_attribute_path` 가 담당합니다.
 
 ## 동작 방식
 
-1. Keycloak 그룹 트리에서 prefix 그룹(팀)을 찾습니다. 팀 이름은 그룹 이름에서
-   prefix 를 제거한 값입니다.
+1. Keycloak 그룹 트리에서 prefix 와 매칭되는 루트 그룹을 찾고, 그 하위
+   그룹(1뎁스)을 팀으로 사용합니다. 팀 이름은 하위 그룹 이름 그대로입니다.
    - Keycloak 23+ 의 `/groups/{id}/children` 엔드포인트를 사용하고,
      구버전에서는 `subGroups` 필드로 자동 fallback 합니다.
 2. 팀 그룹의 직속 멤버와 권한 하위 그룹 멤버(비활성 사용자 제외)를
@@ -71,7 +73,7 @@ grafana-devs            → 팀 "devs" (직속 멤버는 Member 권한)
 | `KEYCLOAK_CLIENT_SECRET` | Y | | client secret — K8s Secret 으로 주입 |
 | `GRAFANA_URL` | Y | | Grafana base URL |
 | `GRAFANA_TOKEN` | Y | | 서비스 계정 토큰 — K8s Secret 으로 주입 |
-| `GROUP_PREFIX` | N | `grafana-` | 관리 대상 그룹 prefix |
+| `GROUP_PREFIX` | N | `grafana-` | 루트 그룹 이름 prefix (예: `service`) |
 | `MATCH_KEY` | N | `email` | `email` 또는 `username`. Grafana `login_attribute_path` 와 일치해야 함 |
 | `DRY_RUN` | N | `true` | 변경 없이 로그만 출력 |
 | `MAX_REMOVAL_RATIO` | N | `0.5` | 팀별 제거 가드 임계값 (0~1) |
