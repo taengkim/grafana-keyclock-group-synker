@@ -148,6 +148,8 @@ time=... level=INFO event=sync_complete teams=7 failed_teams=0 added=4 removed=0
 | `GROUP_PREFIX` | N | `grafana-` | 루트 그룹 이름 prefix (예: `service`) |
 | `MATCH_KEY` | N | `email` | `email` 또는 `username`. Grafana `login_attribute_path` 와 일치해야 함 |
 | `ROLE_SUFFIXES` | N | `adm,admin,editor,viewer,member,mbr` | 인식할 역할 그룹 suffix 목록 (콤마 구분) |
+| `SSL_VERIFY` | N | `true` | `false` 면 Keycloak/Grafana TLS 인증서 검증을 건너뜀 |
+| `SSL_CA_BUNDLE` | N | | 사설 CA 번들(PEM) 경로. 지정 시 이 CA 로 검증 |
 | `DRY_RUN` | N | `true` | 변경 없이 로그만 출력 |
 | `MAX_REMOVAL_RATIO` | N | `0.5` | 팀별 제거 가드 임계값 (0~1) |
 | `LOG_LEVEL` | N | `INFO` | |
@@ -185,6 +187,32 @@ kubectl create secret generic grafana-team-sync \
 
 매니페스트에 평문 시크릿을 넣지 마세요. `k8s/secret.example.yaml` 은 키 이름
 참고용 예시입니다.
+
+### 사설 인증서 환경 (SSL)
+
+내부망에서 자체 서명/사설 CA 인증서를 쓰는 경우 두 가지 방법이 있습니다.
+
+1. **권장 — 사설 CA 번들 지정**: CA 인증서(PEM)를 ConfigMap 으로 마운트하고
+   `SSL_CA_BUNDLE` 로 경로를 지정하면 검증을 유지한 채 동작합니다.
+
+   ```yaml
+   env:
+     - name: SSL_CA_BUNDLE
+       value: /etc/ssl/private/ca.crt
+   volumeMounts:
+     - name: private-ca
+       mountPath: /etc/ssl/private
+       readOnly: true
+   volumes:
+     - name: private-ca
+       configMap:
+         name: private-ca
+   ```
+
+2. **임시 우회 — 검증 비활성화**: `SSL_VERIFY=false` 로 인증서 검증을
+   건너뜁니다. 시작 시 `ssl_verification_disabled` 경고가 로그에 남습니다.
+   중간자 공격에 노출되므로 테스트/임시 용도로만 쓰고, 운영에서는 1번을
+   사용하세요.
 
 ## 최초 배포 절차 (dry-run 먼저)
 
