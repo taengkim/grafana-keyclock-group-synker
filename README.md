@@ -42,7 +42,8 @@ service                 ← GROUP_PREFIX 와 매칭되는 루트 그룹
    `username`)로 Grafana 사용자와 매칭합니다. 비교는 소문자 정규화 후
    수행합니다.
 3. Grafana 에 팀이 없으면 생성하고, 현재 팀 멤버와 비교해 추가/제거합니다.
-   - 아직 Grafana 에 로그인한 적 없는 사용자(lookup 404)는 건너뛰고 pending 으로
+   - 사용자 매칭은 org 사용자 목록(`/api/org/users/search`) 기준입니다. 아직
+     Grafana 에 로그인한 적 없어 목록에 없는 사용자는 건너뛰고 pending 으로
      집계하며, 다음 주기에 자동 재시도됩니다.
    - prefix 밖의 팀은 조회조차 하지 않으므로 절대 변경되지 않습니다.
 
@@ -171,7 +172,10 @@ time=... level=INFO event=sync_complete teams=7 failed_teams=0 added=4 removed=0
 ### 2. Grafana 서비스 계정 발급
 
 1. Grafana → **Administration → Service accounts → Add service account**
-   - Role: **Admin** (org admin — 팀 생성/멤버 관리와 `/api/users/lookup` 에 필요)
+   - Role: **Admin** (org admin — 팀 생성/멤버 관리와 org 사용자 목록 조회에 필요)
+   - 서버 Admin(Grafana Admin)은 필요 없습니다. 사용자 조회는 org Admin 으로
+     접근 가능한 `/api/org/users/search` 를 사용하므로, 서비스 계정에 서버
+     Admin 을 줄 수 없는 Grafana 10+/12 에서도 동작합니다.
 2. 생성한 서비스 계정에서 **Add service account token** 으로 토큰을 발급하고
    K8s Secret 으로 보관합니다.
 3. `MATCH_KEY` 는 grafana.ini 의 OAuth `login_attribute_path` 설정과 일치해야

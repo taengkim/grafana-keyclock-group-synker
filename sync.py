@@ -403,14 +403,32 @@ class GrafanaClient:
             raise ApiError(f"grafana team members fetch failed with status {resp.status_code}", status=resp.status_code)
         return resp.json()
 
-    def lookup_user(self, login_or_email: str) -> dict | None:
-        """Find an org user; None if they have never logged into Grafana yet."""
-        resp = self._request("GET", "/api/users/lookup", params={"loginOrEmail": login_or_email})
-        if resp.status_code == 404:
-            return None
-        if resp.status_code != 200:
-            raise ApiError(f"grafana user lookup failed with status {resp.status_code}", status=resp.status_code)
-        return resp.json()
+    def get_org_users(self) -> list[dict]:
+        """All users of the current org.
+
+        Uses the paginated /api/org/users/search endpoint (org Admin is
+        sufficient — unlike /api/users/lookup, which needs server admin
+        and 403s for org-Admin service accounts on Grafana 10+). Falls
+        back to the plain /api/org/users listing when search is absent.
+        """
+        users: list[dict] = []
+        page = 1
+        while True:
+            resp = self._request("GET", "/api/org/users/search", params={"perpage": PAGE_SIZE, "page": page})
+            if resp.status_code == 404:
+                resp = self._request("GET", "/api/org/users")
+                if resp.status_code != 200:
+                    raise ApiError(f"grafana org users fetch failed with status {resp.status_code}", status=resp.status_code)
+                return resp.json()
+            if resp.status_code != 200:
+                raise ApiError(f"grafana org users search failed with status {resp.status_code}", status=resp.status_code)
+            payload = resp.json()
+            batch = payload.get("orgUsers", [])
+            users.extend(batch)
+            total = payload.get("totalCount", len(users))
+            if not batch or len(users) >= total:
+                return users
+            page += 1
 
     def add_team_member(self, team_id: int, user_id: int) -> None:
         resp = self._request("POST", f"/api/teams/{team_id}/members", json={"userId": user_id})
@@ -455,7 +473,18 @@ def member_key(cfg: Config, member: dict) -> str:
     return (raw or "").strip().lower()
 
 
-def sync_team(cfg: Config, kc: KeycloakClient, gf: GrafanaClient, team_name: str, groups: list[dict]) -> TeamResult:
+def build_user_index(cfg: Config, org_users: list[dict]) -> dict[str, int]:
+    """Map match key (lowercased email/login) -> Grafana user id."""
+    index: dict[str, int] = {}
+    for user in org_users:
+        key = member_key(cfg, user)
+        if key:
+            index[key] = user["userId"]
+    return index
+
+
+def sync_team(cfg: Config, kc: KeycloakClient, gf: GrafanaClient, team_name: str,
+              groups: list[dict], user_index: dict[str, int]) -> TeamResult:
     result = TeamResult()
     desired = desired_members(cfg, kc, team_name, groups)
 
@@ -496,8 +525,9 @@ def sync_team(cfg: Config, kc: KeycloakClient, gf: GrafanaClient, team_name: str
         to_remove = []
 
     for key in to_add:
-        user = gf.lookup_user(key)
-        if user is None:
+        user_id = user_index.get(key)
+        if user_id is None:
+            # Not in the org yet: the user has never logged into Grafana.
             result.pending += 1
             log_event(logging.INFO, "member_pending_first_login", team=team_name, target=key)
             continue
@@ -505,7 +535,7 @@ def sync_team(cfg: Config, kc: KeycloakClient, gf: GrafanaClient, team_name: str
             log_event(logging.INFO, "would_add_member", team=team_name, target=key)
         else:
             log_event(logging.INFO, "add_member", team=team_name, target=key)
-            gf.add_team_member(team_id, user["id"])
+            gf.add_team_member(team_id, user_id)
         result.added += 1
 
     for key in to_remove:
@@ -578,12 +608,16 @@ def run_sync(cfg: Config, kc: KeycloakClient | None = None, gf: GrafanaClient | 
         )
         return EXIT_OK
 
+    # One org-wide user listing instead of per-user lookups: org Admin
+    # is sufficient, and membership diffs resolve against this index.
+    user_index = build_user_index(cfg, gf.get_org_users())
+
     exit_code = EXIT_OK
     total = TeamResult()
     failed_teams = 0
     for team_name in sorted(teams):
         try:
-            result = sync_team(cfg, kc, gf, team_name, teams[team_name])
+            result = sync_team(cfg, kc, gf, team_name, teams[team_name], user_index)
         except (ApiError, requests.RequestException) as exc:
             failed_teams += 1
             exit_code = EXIT_PARTIAL
