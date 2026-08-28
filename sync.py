@@ -135,6 +135,15 @@ class Config:
     max_removal_ratio: float = 0.5
     log_level: str = "INFO"
     role_suffixes: frozenset = frozenset(DEFAULT_ROLE_SUFFIXES)
+    ssl_verify: bool = True
+    ssl_ca_bundle: str = ""
+
+    @property
+    def effective_ssl_verify(self):
+        """Value for requests' verify=: False, a CA bundle path, or True."""
+        if not self.ssl_verify:
+            return False
+        return self.ssl_ca_bundle or True
 
     REQUIRED = (
         "KEYCLOAK_URL",
@@ -170,6 +179,11 @@ class Config:
         raw_role_suffixes = env.get("ROLE_SUFFIXES", "")
         role_suffixes = parse_role_suffixes(raw_role_suffixes) if raw_role_suffixes.strip() else frozenset(DEFAULT_ROLE_SUFFIXES)
 
+        ssl_verify = parse_bool(env.get("SSL_VERIFY", "true"), "SSL_VERIFY")
+        ssl_ca_bundle = env.get("SSL_CA_BUNDLE", "").strip()
+        if ssl_ca_bundle and not os.path.isfile(ssl_ca_bundle):
+            raise ConfigError(f"SSL_CA_BUNDLE file not found: {ssl_ca_bundle!r}")
+
         return cls(
             keycloak_url=env["KEYCLOAK_URL"].rstrip("/"),
             keycloak_realm=env["KEYCLOAK_REALM"],
@@ -183,6 +197,8 @@ class Config:
             max_removal_ratio=max_removal_ratio,
             log_level=env.get("LOG_LEVEL", "INFO"),
             role_suffixes=role_suffixes,
+            ssl_verify=ssl_verify,
+            ssl_ca_bundle=ssl_ca_bundle,
         )
 
 
@@ -218,11 +234,13 @@ def request_with_retry(session: requests.Session, method: str, url: str, **kwarg
 
 
 class KeycloakClient:
-    def __init__(self, url: str, realm: str, client_id: str, client_secret: str, session: requests.Session | None = None):
+    def __init__(self, url: str, realm: str, client_id: str, client_secret: str,
+                 session: requests.Session | None = None, verify=True):
         self.base = url.rstrip("/")
         self.realm = realm
         self.client_id = client_id
         self.client_secret = client_secret
+        self.verify = verify
         self.session = session or requests.Session()
         self._token: str | None = None
         # None = unknown, decided on first /children call (Keycloak >= 23
@@ -243,6 +261,7 @@ class KeycloakClient:
                 "client_id": self.client_id,
                 "client_secret": self.client_secret,
             },
+            verify=self.verify,
         )
         if resp.status_code != 200:
             raise AuthError(f"keycloak token request failed with status {resp.status_code}")
@@ -255,6 +274,7 @@ class KeycloakClient:
         resp = request_with_retry(
             self.session, method, url, params=params,
             headers={"Authorization": f"Bearer {self._token}"},
+            verify=self.verify,
         )
         if resp.status_code == 401:
             # Token likely expired mid-run: re-issue once and retry.
@@ -263,6 +283,7 @@ class KeycloakClient:
             resp = request_with_retry(
                 self.session, method, url, params=params,
                 headers={"Authorization": f"Bearer {self._token}"},
+                verify=self.verify,
             )
             if resp.status_code == 401:
                 raise AuthError("keycloak request unauthorized after token refresh")
@@ -342,15 +363,17 @@ class KeycloakClient:
 
 
 class GrafanaClient:
-    def __init__(self, url: str, token: str, session: requests.Session | None = None):
+    def __init__(self, url: str, token: str, session: requests.Session | None = None, verify=True):
         self.base = url.rstrip("/")
         self.token = token
+        self.verify = verify
         self.session = session or requests.Session()
 
     def _request(self, method: str, path: str, params: dict | None = None, json: dict | None = None) -> requests.Response:
         resp = request_with_retry(
             self.session, method, f"{self.base}{path}", params=params, json=json,
             headers={"Authorization": f"Bearer {self.token}"},
+            verify=self.verify,
         )
         if resp.status_code in (401, 403):
             raise AuthError(
@@ -503,8 +526,21 @@ def sync_team(cfg: Config, kc: KeycloakClient, gf: GrafanaClient, team_name: str
 
 
 def run_sync(cfg: Config, kc: KeycloakClient | None = None, gf: GrafanaClient | None = None) -> int:
-    kc = kc or KeycloakClient(cfg.keycloak_url, cfg.keycloak_realm, cfg.keycloak_client_id, cfg.keycloak_client_secret)
-    gf = gf or GrafanaClient(cfg.grafana_url, cfg.grafana_token)
+    verify = cfg.effective_ssl_verify
+    if verify is False:
+        log_event(
+            logging.WARNING, "ssl_verification_disabled",
+            detail="TLS certificates are NOT verified; prefer SSL_CA_BUNDLE with a private CA",
+        )
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    kc = kc or KeycloakClient(
+        cfg.keycloak_url, cfg.keycloak_realm, cfg.keycloak_client_id, cfg.keycloak_client_secret,
+        verify=verify,
+    )
+    gf = gf or GrafanaClient(cfg.grafana_url, cfg.grafana_token, verify=verify)
 
     if cfg.dry_run:
         log_event(logging.INFO, "dry_run_enabled")

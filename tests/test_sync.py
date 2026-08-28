@@ -541,6 +541,71 @@ def test_config_invalid_role_suffixes():
         sync.parse_role_suffixes("  ,  ")
 
 
+BASE_ENV = {
+    "KEYCLOAK_URL": KC,
+    "KEYCLOAK_REALM": REALM,
+    "KEYCLOAK_CLIENT_ID": "grafana-sync",
+    "KEYCLOAK_CLIENT_SECRET": "secret",
+    "GRAFANA_URL": GF,
+    "GRAFANA_TOKEN": "gf-token",
+}
+
+
+def test_config_ssl_verify_defaults_to_true():
+    cfg = sync.Config.from_env(dict(BASE_ENV))
+    assert cfg.ssl_verify is True
+    assert cfg.effective_ssl_verify is True
+
+
+def test_config_ssl_verify_can_be_disabled():
+    cfg = sync.Config.from_env({**BASE_ENV, "SSL_VERIFY": "false"})
+    assert cfg.ssl_verify is False
+    assert cfg.effective_ssl_verify is False
+
+
+def test_config_ssl_ca_bundle(tmp_path):
+    bundle = tmp_path / "ca.crt"
+    bundle.write_text("dummy")
+    cfg = sync.Config.from_env({**BASE_ENV, "SSL_CA_BUNDLE": str(bundle)})
+    assert cfg.effective_ssl_verify == str(bundle)
+
+
+def test_config_ssl_ca_bundle_missing_file_is_config_error():
+    with pytest.raises(sync.ConfigError):
+        sync.Config.from_env({**BASE_ENV, "SSL_CA_BUNDLE": "/does/not/exist.crt"})
+
+
+class _RecordingSession:
+    """Stub session capturing request kwargs."""
+
+    def __init__(self, payload):
+        self.calls = []
+        self._payload = payload
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+
+        class _Resp:
+            status_code = 200
+
+            def json(_self):
+                return self._payload
+
+        return _Resp()
+
+
+def test_clients_pass_verify_to_requests():
+    session = _RecordingSession({"access_token": "t"})
+    kc = sync.KeycloakClient(KC, REALM, "cid", "cs", session=session, verify=False)
+    kc._fetch_token()
+    assert session.calls[0][2]["verify"] is False
+
+    session = _RecordingSession({"totalCount": 0, "teams": []})
+    gf = sync.GrafanaClient(GF, "tok", session=session, verify="/etc/ssl/private-ca.crt")
+    gf.find_team("devs")
+    assert session.calls[0][2]["verify"] == "/etc/ssl/private-ca.crt"
+
+
 def test_config_invalid_match_key():
     with pytest.raises(sync.ConfigError):
         sync.Config.from_env({
