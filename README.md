@@ -214,6 +214,73 @@ kubectl create secret generic grafana-team-sync \
    중간자 공격에 노출되므로 테스트/임시 용도로만 쓰고, 운영에서는 1번을
    사용하세요.
 
+## 사용법
+
+### 로컬 실행
+
+의존성을 설치하고 환경변수를 지정해 바로 실행할 수 있습니다.
+`DRY_RUN` 기본값이 `true` 라서 그냥 실행하면 변경 없이 예상 diff 만 출력됩니다.
+
+```sh
+pip install -r requirements.txt
+
+export KEYCLOAK_URL=https://keycloak.example.com
+export KEYCLOAK_REALM=my-realm
+export KEYCLOAK_CLIENT_ID=grafana-team-sync
+export KEYCLOAK_CLIENT_SECRET=...
+export GRAFANA_URL=https://grafana.example.com
+export GRAFANA_TOKEN=...
+export GROUP_PREFIX=service
+export ROLE_SUFFIXES="adm,editor,viewer"
+
+python sync.py            # dry-run: 로그만 출력
+DRY_RUN=false python sync.py   # 실제 반영
+echo $?                   # 0 정상 / 1 부분 실패 / 2 설정·인증 오류
+```
+
+사설 인증서 환경이면 `SSL_CA_BUNDLE=/path/ca.crt`(권장) 또는
+`SSL_VERIFY=false`(임시)를 추가합니다.
+
+### Docker 실행
+
+```sh
+docker build -t grafana-team-sync .
+
+cat > sync.env <<'EOF'
+KEYCLOAK_URL=https://keycloak.example.com
+KEYCLOAK_REALM=my-realm
+KEYCLOAK_CLIENT_ID=grafana-team-sync
+KEYCLOAK_CLIENT_SECRET=...
+GRAFANA_URL=https://grafana.example.com
+GRAFANA_TOKEN=...
+GROUP_PREFIX=service
+ROLE_SUFFIXES=adm,editor,viewer
+DRY_RUN=true
+EOF
+
+docker run --rm --env-file sync.env grafana-team-sync
+```
+
+### Kubernetes (CronJob)
+
+시크릿 생성 후 CronJob 을 배포하면 10분마다 자동 실행됩니다.
+상세 절차는 아래 [최초 배포 절차](#최초-배포-절차-dry-run-먼저)를 따르세요.
+
+```sh
+kubectl create secret generic grafana-team-sync \
+  --from-literal=KEYCLOAK_CLIENT_SECRET='...' \
+  --from-literal=GRAFANA_TOKEN='...'
+kubectl apply -f k8s/cronjob.yaml
+
+# 수동으로 1회 실행
+kubectl create job --from=cronjob/grafana-team-sync team-sync-manual
+kubectl logs -f job/team-sync-manual
+
+# 일시 중지 / 재개
+kubectl patch cronjob grafana-team-sync -p '{"spec":{"suspend":true}}'
+kubectl patch cronjob grafana-team-sync -p '{"spec":{"suspend":false}}'
+```
+
 ## 최초 배포 절차 (dry-run 먼저)
 
 1. 이미지를 빌드해 레지스트리에 푸시합니다.
