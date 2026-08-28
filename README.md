@@ -47,6 +47,64 @@ service                 ← GROUP_PREFIX 와 매칭되는 루트 그룹
      집계하며, 다음 주기에 자동 재시도됩니다.
    - prefix 밖의 팀은 조회조차 하지 않으므로 절대 변경되지 않습니다.
 
+## 예제
+
+Keycloak 그룹이 다음과 같다고 하겠습니다.
+
+```
+service
+├── abc
+│   ├── abc_adm          멤버: alice@example.com
+│   └── abc_member       멤버: bob@example.com, carol@example.com
+├── xyz                  직속 멤버: dave@example.com
+│   └── xyz_adm          멤버: alice@example.com
+└── legacy
+    └── legacy_ops       ← 매핑에 없는 이름: 경고 후 스킵
+hr                       ← prefix 미매칭: 아예 조회하지 않음
+└── payroll
+```
+
+설정:
+
+```sh
+GROUP_PREFIX=service
+PERMISSION_MAP="adm=admin,member=member"
+MATCH_KEY=email
+DRY_RUN=false
+```
+
+동기화 결과 Grafana 상태:
+
+| 팀 | 멤버 | 팀 권한 |
+|---|---|---|
+| `abc` | alice@example.com | Admin |
+| `abc` | bob@example.com | Member |
+| `abc` | carol@example.com | Member |
+| `xyz` | dave@example.com | Member (팀 그룹 직속 멤버) |
+| `xyz` | alice@example.com | Admin |
+| `legacy` | (없음) | `legacy_ops` 는 스킵, 빈 팀만 생성 |
+
+- `hr`/`payroll` 은 prefix 밖이므로 팀이 생성되지 않고, 같은 이름의 기존
+  Grafana 팀이 있어도 건드리지 않습니다.
+- carol 이 아직 Grafana 에 로그인한 적이 없다면 이번 주기에는
+  `member_pending_first_login` 으로 건너뛰고, 최초 로그인 후 다음 주기에
+  자동으로 팀에 편입됩니다.
+- 이후 Keycloak 에서 bob 을 `abc_member` 에서 빼면 다음 주기에 팀 `abc` 에서도
+  제거되고, alice 를 `abc_adm` 에서 `abc_member` 로 옮기면 Admin → Member 로
+  강등됩니다.
+
+`DRY_RUN=true` 로 먼저 실행하면 위 변경이 다음과 같은 로그로만 출력됩니다.
+
+```
+time=... level=INFO event=dry_run_enabled
+time=... level=INFO event=would_create_team team=abc
+time=... level=INFO event=would_add_member team=abc target=alice@example.com permission=Admin
+time=... level=INFO event=would_add_member team=abc target=bob@example.com permission=Member
+time=... level=INFO event=member_pending_first_login team=abc target=carol@example.com
+time=... level=WARNING event=unknown_permission_group_skipped team=legacy group=legacy_ops expected=legacy_adm|legacy_member
+time=... level=INFO event=sync_complete teams=3 failed_teams=0 added=4 removed=0 permission_updates=0 pending_first_login=1 dry_run=True exit_code=0
+```
+
 ### 범위 밖 (별도 작업)
 
 - 폴더 ↔ 팀 권한 부여, org 롤 매핑(`role_attribute_path`), grafana.ini 변경
