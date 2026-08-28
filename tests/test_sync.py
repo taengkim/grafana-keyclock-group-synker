@@ -99,19 +99,16 @@ def add_team_search(name, team=None):
     )
 
 
-def add_lookup(key, user_id=None):
-    if user_id is None:
-        responses.add(
-            responses.GET, f"{GF}/api/users/lookup",
-            match=[matchers.query_param_matcher({"loginOrEmail": key})],
-            json={"message": "user not found"}, status=404,
-        )
-    else:
-        responses.add(
-            responses.GET, f"{GF}/api/users/lookup",
-            match=[matchers.query_param_matcher({"loginOrEmail": key})],
-            json={"id": user_id, "email": key},
-        )
+def org_user(user_id, email, login=None):
+    return {"orgId": 1, "userId": user_id, "email": email, "login": login or email.split("@")[0], "role": "Viewer"}
+
+
+def add_org_users(users):
+    """Register the org user listing (/api/org/users/search, single page)."""
+    responses.add(
+        responses.GET, f"{GF}/api/org/users/search",
+        json={"totalCount": len(users), "page": 1, "perPage": 100, "orgUsers": users},
+    )
 
 
 def write_calls():
@@ -137,8 +134,7 @@ def test_creates_new_team_and_adds_members():
     add_members("g1", [kc_user("alice@example.com"), kc_user("bob@example.com")])
     add_team_search("devs")  # team does not exist yet
     responses.add(responses.POST, f"{GF}/api/teams", json={"teamId": 7, "message": "Team created"})
-    add_lookup("alice@example.com", user_id=101)
-    add_lookup("bob@example.com", user_id=102)
+    add_org_users([org_user(101, "alice@example.com"), org_user(102, "bob@example.com")])
     added = responses.add(responses.POST, f"{GF}/api/teams/7/members", json={"message": "Member added"})
 
     assert sync.run_sync(make_config()) == 0
@@ -164,9 +160,11 @@ def test_role_groups_become_independent_teams():
     add_team_search("abc_editor")
     add_team_search("abc_viewer")
     responses.add(responses.POST, f"{GF}/api/teams", json={"teamId": 7, "message": "Team created"})
-    add_lookup("alice@example.com", user_id=101)
-    add_lookup("bob@example.com", user_id=102)
-    add_lookup("carol@example.com", user_id=103)
+    add_org_users([
+        org_user(101, "alice@example.com"),
+        org_user(102, "bob@example.com"),
+        org_user(103, "carol@example.com"),
+    ])
     responses.add(responses.POST, f"{GF}/api/teams/7/members", json={"message": "Member added"})
 
     assert sync.run_sync(make_config()) == 0
@@ -181,6 +179,7 @@ def test_service_direct_members_sync_to_service_team():
     add_children("g1", [{"id": "g2", "name": "abc_viewer"}])
     add_members("g1", [kc_user("dave@example.com")])
     add_members("g2", [kc_user("erin@example.com")])
+    add_org_users([org_user(104, "dave@example.com"), org_user(105, "erin@example.com")])
     add_team_search("abc", {"id": 7, "name": "abc"})
     add_team_search("abc_viewer", {"id": 8, "name": "abc_viewer"})
     responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[gf_member(104, "dave@example.com")])
@@ -197,6 +196,7 @@ def test_empty_service_team_is_not_created(caplog):
     add_children("g1", [{"id": "g2", "name": "abc_adm"}])
     add_members("g1", [])
     add_members("g2", [kc_user("alice@example.com")])
+    add_org_users([org_user(101, "alice@example.com")])
     add_team_search("abc")      # does not exist and has no desired members
     add_team_search("abc_adm", {"id": 8, "name": "abc_adm"})
     responses.add(responses.GET, f"{GF}/api/teams/8/members", json=[gf_member(101, "alice@example.com")])
@@ -212,6 +212,7 @@ def test_unknown_role_group_is_skipped(caplog):
     add_tree([{"id": "g1", "name": "devs"}], empty_children=False)
     add_children("g1", [{"id": "g2", "name": "devs_leads"}, {"id": "g3", "name": "other_adm"}])
     add_members("g1", [kc_user("alice@example.com")])
+    add_org_users([org_user(101, "alice@example.com")])
     add_team_search("devs", {"id": 7, "name": "devs"})
     responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[gf_member(101, "alice@example.com")])
 
@@ -230,10 +231,10 @@ def test_custom_role_suffixes():
     add_children("g1", [{"id": "g2", "name": "abc_ops"}])
     add_members("g1", [])
     add_members("g2", [kc_user("alice@example.com")])
+    add_org_users([org_user(101, "alice@example.com")])
     add_team_search("abc")
     add_team_search("abc_ops")
     created = responses.add(responses.POST, f"{GF}/api/teams", json={"teamId": 7, "message": "Team created"})
-    add_lookup("alice@example.com", user_id=101)
     responses.add(responses.POST, f"{GF}/api/teams/7/members", json={"message": "Member added"})
 
     assert sync.run_sync(make_config(role_suffixes=frozenset({"ops"}))) == 0
@@ -246,6 +247,7 @@ def test_removes_member_no_longer_in_group():
     add_token_endpoint()
     add_tree([{"id": "g1", "name": "devs"}])
     add_members("g1", [kc_user("alice@example.com")])
+    add_org_users([org_user(101, "alice@example.com"), org_user(102, "bob@example.com")])
     add_team_search("devs", {"id": 7, "name": "devs"})
     responses.add(
         responses.GET, f"{GF}/api/teams/7/members",
@@ -269,7 +271,11 @@ def test_add_and_remove_in_same_team():
         responses.GET, f"{GF}/api/teams/7/members",
         json=[gf_member(101, "alice@example.com"), gf_member(102, "bob@example.com")],
     )
-    add_lookup("carol@example.com", user_id=103)
+    add_org_users([
+        org_user(101, "alice@example.com"),
+        org_user(102, "bob@example.com"),
+        org_user(103, "carol@example.com"),
+    ])
     added = responses.add(responses.POST, f"{GF}/api/teams/7/members", json={"message": "Member added"})
     removed = responses.add(responses.DELETE, f"{GF}/api/teams/7/members/102", json={"message": "Member removed"})
 
@@ -285,7 +291,7 @@ def test_user_not_yet_in_grafana_is_skipped_as_pending(caplog):
     add_members("g1", [kc_user("alice@example.com"), kc_user("newbie@example.com")])
     add_team_search("devs", {"id": 7, "name": "devs"})
     responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[gf_member(101, "alice@example.com")])
-    add_lookup("newbie@example.com", user_id=None)  # 404: never logged in
+    add_org_users([org_user(101, "alice@example.com")])  # newbie not in the org yet
 
     assert sync.run_sync(make_config()) == 0
     assert not grafana_write_calls()
@@ -335,7 +341,7 @@ def test_removal_ratio_guard_skips_team_and_exits_1(caplog):
     add_members("g2", [kc_user("erin@example.com")])
     add_team_search("ops", {"id": 8, "name": "ops"})
     responses.add(responses.GET, f"{GF}/api/teams/8/members", json=[])
-    add_lookup("erin@example.com", user_id=105)
+    add_org_users([org_user(101, "alice@example.com"), org_user(105, "erin@example.com")])
     ops_add = responses.add(responses.POST, f"{GF}/api/teams/8/members", json={"message": "Member added"})
 
     assert sync.run_sync(make_config()) == 1
@@ -361,6 +367,7 @@ def test_subgroups_fallback_for_old_keycloak():
     responses.add(responses.GET, f"{ADMIN}/groups/root/children", status=404, json={"error": "unknown_error"})
     add_members("g1", [kc_user("alice@example.com")])
     add_members("g2", [kc_user("bob@example.com")])
+    add_org_users([org_user(101, "alice@example.com"), org_user(102, "bob@example.com")])
     add_team_search("devs", {"id": 7, "name": "devs"})
     add_team_search("devs_adm", {"id": 8, "name": "devs_adm"})
     responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[gf_member(101, "alice@example.com")])
@@ -384,6 +391,7 @@ def test_member_pagination_over_multiple_pages():
         responses.GET, f"{ADMIN}/groups/g1/members",
         match=[matchers.query_param_matcher({"first": "100", "max": "100"})], json=page2,
     )
+    add_org_users([])
     add_team_search("big", {"id": 9, "name": "big"})
     # All 105 already members: pagination worked iff nobody is added/removed
     responses.add(
@@ -395,6 +403,51 @@ def test_member_pagination_over_multiple_pages():
     assert not grafana_write_calls()
     member_calls = [c for c in responses.calls if "/groups/g1/members" in c.request.url]
     assert len(member_calls) == 2
+
+
+@responses.activate
+def test_org_users_pagination_over_multiple_pages():
+    add_token_endpoint()
+    add_tree([{"id": "g1", "name": "devs"}])
+    add_members("g1", [kc_user("user0@example.com"), kc_user("user100@example.com")])
+    # 101 org users spread over two search pages; user100 is on page 2
+    page1 = [org_user(1000 + i, f"user{i}@example.com") for i in range(100)]
+    page2 = [org_user(1100, "user100@example.com")]
+    responses.add(
+        responses.GET, f"{GF}/api/org/users/search",
+        match=[matchers.query_param_matcher({"perpage": "100", "page": "1"})],
+        json={"totalCount": 101, "page": 1, "perPage": 100, "orgUsers": page1},
+    )
+    responses.add(
+        responses.GET, f"{GF}/api/org/users/search",
+        match=[matchers.query_param_matcher({"perpage": "100", "page": "2"})],
+        json={"totalCount": 101, "page": 2, "perPage": 100, "orgUsers": page2},
+    )
+    add_team_search("devs")
+    responses.add(responses.POST, f"{GF}/api/teams", json={"teamId": 7, "message": "Team created"})
+    added = responses.add(responses.POST, f"{GF}/api/teams/7/members", json={"message": "Member added"})
+
+    # user100 resolvable only if page 2 was fetched
+    assert sync.run_sync(make_config()) == 0
+    assert added.call_count == 2
+    search_calls = [c for c in responses.calls if "/api/org/users/search" in c.request.url]
+    assert len(search_calls) == 2
+
+
+@responses.activate
+def test_org_users_fallback_for_old_grafana():
+    add_token_endpoint()
+    add_tree([{"id": "g1", "name": "devs"}])
+    add_members("g1", [kc_user("alice@example.com")])
+    # Older Grafana without the /search endpoint
+    responses.add(responses.GET, f"{GF}/api/org/users/search", status=404, json={"message": "Not found"})
+    responses.add(responses.GET, f"{GF}/api/org/users", json=[org_user(101, "alice@example.com")])
+    add_team_search("devs")
+    responses.add(responses.POST, f"{GF}/api/teams", json={"teamId": 7, "message": "Team created"})
+    added = responses.add(responses.POST, f"{GF}/api/teams/7/members", json={"message": "Member added"})
+
+    assert sync.run_sync(make_config()) == 0
+    assert added.call_count == 1
 
 
 @responses.activate
@@ -411,8 +464,7 @@ def test_dry_run_makes_no_write_calls(caplog):
         json=[gf_member(102, "bob@example.com"), gf_member(101, "old@example.com")],
     )
     add_team_search("new")  # would need to be created
-    add_lookup("carol@example.com", user_id=103)
-    add_lookup("alice@example.com", user_id=101)
+    add_org_users([org_user(103, "carol@example.com"), org_user(101, "alice@example.com")])
 
     assert sync.run_sync(make_config(dry_run=True, max_removal_ratio=1.0)) == 0
     assert not grafana_write_calls()
@@ -426,6 +478,7 @@ def test_disabled_users_are_excluded():
     add_token_endpoint()
     add_tree([{"id": "g1", "name": "devs"}])
     add_members("g1", [kc_user("alice@example.com"), kc_user("gone@example.com", enabled=False)])
+    add_org_users([org_user(101, "alice@example.com")])
     add_team_search("devs", {"id": 7, "name": "devs"})
     responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[gf_member(101, "alice@example.com")])
 
@@ -442,6 +495,7 @@ def test_keycloak_token_refresh_on_401():
     responses.add(responses.GET, f"{ADMIN}/groups/{ROOT['id']}/children", json=[{"id": "g1", "name": "devs"}])
     add_children("g1", [])
     add_members("g1", [kc_user("alice@example.com")])
+    add_org_users([org_user(101, "alice@example.com")])
     add_team_search("devs", {"id": 7, "name": "devs"})
     responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[gf_member(101, "alice@example.com")])
 
@@ -454,6 +508,7 @@ def test_missing_match_key_user_is_skipped(caplog):
     add_token_endpoint()
     add_tree([{"id": "g1", "name": "devs"}])
     add_members("g1", [{"id": "kc-x", "username": "no-email-user", "email": None, "enabled": True}])
+    add_org_users([])
     add_team_search("devs", {"id": 7, "name": "devs"})
     responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[])
 
@@ -467,6 +522,7 @@ def test_match_key_username_uses_login_and_is_case_insensitive():
     add_token_endpoint()
     add_tree([{"id": "g1", "name": "devs"}])
     add_members("g1", [kc_user("alice@example.com", username="Alice")])
+    add_org_users([org_user(101, "other@example.com", login="alice")])
     add_team_search("devs", {"id": 7, "name": "devs"})
     responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[{"userId": 101, "email": "other@example.com", "login": "alice"}])
 
@@ -488,7 +544,7 @@ def test_grafana_auth_failure_exits_2():
     add_token_endpoint()
     add_tree([{"id": "g1", "name": "devs"}])
     add_members("g1", [kc_user("alice@example.com")])
-    responses.add(responses.GET, f"{GF}/api/teams/search", status=401, json={"message": "Unauthorized"})
+    responses.add(responses.GET, f"{GF}/api/org/users/search", status=401, json={"message": "Unauthorized"})
 
     env = {
         "KEYCLOAK_URL": KC,
@@ -652,7 +708,7 @@ def test_one_failed_team_does_not_stop_others():
     )
     add_team_search("ops", {"id": 8, "name": "ops"})
     responses.add(responses.GET, f"{GF}/api/teams/8/members", json=[])
-    add_lookup("erin@example.com", user_id=105)
+    add_org_users([org_user(101, "alice@example.com"), org_user(105, "erin@example.com")])
     ops_add = responses.add(responses.POST, f"{GF}/api/teams/8/members", json={"message": "Member added"})
 
     assert sync.run_sync(make_config()) == 1
