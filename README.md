@@ -6,43 +6,42 @@ Grafana Enterprise 의 Team Sync 를 대체하며, Kubernetes CronJob 으로 10�
 ## 그룹 구조
 
 `GROUP_PREFIX`(예: `service`)로 시작하는 그룹이 **루트 그룹**이고,
-루트의 **1뎁스 하위가 팀**, 그 **다음 뎁스가 권한 그룹**입니다.
+루트의 **1뎁스 하위가 서비스(팀명)**, 그 **다음 뎁스가 역할 그룹**입니다.
+역할 그룹은 각각 **독립 Grafana 팀**으로 동기화됩니다.
 
 ```
 service                 ← GROUP_PREFIX 와 매칭되는 루트 그룹
-└── abc                 → Grafana 팀 "abc" (직속 멤버는 Member 권한)
-    ├── abc_member      → 팀 "abc" 의 Member
-    └── abc_adm         → 팀 "abc" 의 Admin (팀 관리자)
+└── abc                 → (직속 멤버가 있으면) Grafana 팀 "abc"
+    ├── abc_adm         → Grafana 팀 "abc_adm"
+    ├── abc_editor      → Grafana 팀 "abc_editor"
+    └── abc_viewer      → Grafana 팀 "abc_viewer"
 ```
 
-- 권한 그룹 이름 → 권한 매핑은 `PERMISSION_MAP` 환경변수로 정의합니다.
-  형식은 `<suffix>=<admin|member>` 쌍의 콤마 구분 목록입니다.
-
-  ```sh
-  # 예: abc_adm → Admin, abc_mbr → Member
-  PERMISSION_MAP="adm=admin,mbr=member"
-  ```
-
-  suffix 는 `<팀명>_<suffix>`, `<팀명>-<suffix>`, 또는 suffix 단독 이름과
-  매칭됩니다 (대소문자 무관). 미설정 시 기본값은
-  `adm=admin,admin=admin,member=member,mbr=member,mem=member` 입니다.
-  매핑에 없는 이름의 하위 그룹은 경고 로그를 남기고 건너뜁니다.
-- 팀 그룹의 직속 멤버는 Member 로 취급합니다. 한 사용자가 member 와 admin
-  양쪽에 있으면 Admin 이 우선합니다.
-- 여기서 말하는 권한은 Grafana **팀 멤버 권한**(Member/Admin)입니다.
-  org 롤(Viewer/Editor/Admin)은 기존대로 `role_attribute_path` 가 담당합니다.
+- **Admin/Editor/Viewer 권한 부여는 폴더 권한 단계에서** 이뤄집니다.
+  Grafana 팀 멤버십 자체에는 Editor/Viewer 개념이 없으므로, 이 도구는 역할별
+  팀만 만들어 주고, 폴더 ↔ 팀 권한(Admin/Edit/View)은 별도 작업(Terraform
+  또는 수동)에서 `abc_adm`→Admin, `abc_editor`→Edit, `abc_viewer`→View 로
+  부여합니다.
+- 인식하는 역할 suffix 는 `ROLE_SUFFIXES` 환경변수로 정의합니다 (기본값
+  `adm,admin,editor,viewer,member,mbr`). 역할 그룹 이름은
+  `<서비스명>_<suffix>` 또는 `<서비스명>-<suffix>` 형태여야 하며(대소문자
+  무관), 그 외 이름의 하위 그룹은 경고 로그를 남기고 건너뜁니다.
+- 서비스 그룹의 직속 멤버는 서비스명과 같은 이름의 팀으로 동기화됩니다.
+  직속 멤버가 없고 같은 이름의 팀도 아직 없으면 빈 팀을 만들지 않습니다.
+- org 롤(Viewer/Editor/Admin)은 기존대로 `role_attribute_path` 가 담당합니다.
+  이 도구는 팀 멤버십만 책임집니다.
 
 ## 동작 방식
 
 1. Keycloak 그룹 트리에서 prefix 와 매칭되는 루트 그룹을 찾고, 그 하위
-   그룹(1뎁스)을 팀으로 사용합니다. 팀 이름은 하위 그룹 이름 그대로입니다.
+   서비스 그룹의 역할 그룹들을 팀 목록으로 만듭니다. 팀 이름은 역할 그룹
+   이름 그대로입니다 (예: `abc_adm`).
    - Keycloak 23+ 의 `/groups/{id}/children` 엔드포인트를 사용하고,
      구버전에서는 `subGroups` 필드로 자동 fallback 합니다.
-2. 팀 그룹의 직속 멤버와 권한 하위 그룹 멤버(비활성 사용자 제외)를
-   `MATCH_KEY`(`email` 기본 또는 `username`)로 Grafana 사용자와 매칭합니다.
-   비교는 소문자 정규화 후 수행합니다.
-3. Grafana 에 팀이 없으면 생성하고, 현재 팀 멤버와 비교해 추가/제거하며,
-   권한이 다른 기존 멤버는 권한을 갱신합니다.
+2. 각 그룹의 직속 멤버(비활성 사용자 제외)를 `MATCH_KEY`(`email` 기본 또는
+   `username`)로 Grafana 사용자와 매칭합니다. 비교는 소문자 정규화 후
+   수행합니다.
+3. Grafana 에 팀이 없으면 생성하고, 현재 팀 멤버와 비교해 추가/제거합니다.
    - 아직 Grafana 에 로그인한 적 없는 사용자(lookup 404)는 건너뛰고 pending 으로
      집계하며, 다음 주기에 자동 재시도됩니다.
    - prefix 밖의 팀은 조회조차 하지 않으므로 절대 변경되지 않습니다.
@@ -55,11 +54,12 @@ Keycloak 그룹이 다음과 같다고 하겠습니다.
 service
 ├── abc
 │   ├── abc_adm          멤버: alice@example.com
-│   └── abc_member       멤버: bob@example.com, carol@example.com
+│   ├── abc_editor       멤버: bob@example.com
+│   └── abc_viewer       멤버: carol@example.com
 ├── xyz                  직속 멤버: dave@example.com
-│   └── xyz_adm          멤버: alice@example.com
+│   └── xyz_viewer       멤버: erin@example.com
 └── legacy
-    └── legacy_ops       ← 매핑에 없는 이름: 경고 후 스킵
+    └── legacy_ops       ← suffix 미인식: 경고 후 스킵
 hr                       ← prefix 미매칭: 아예 조회하지 않음
 └── payroll
 ```
@@ -68,41 +68,46 @@ hr                       ← prefix 미매칭: 아예 조회하지 않음
 
 ```sh
 GROUP_PREFIX=service
-PERMISSION_MAP="adm=admin,member=member"
+ROLE_SUFFIXES="adm,editor,viewer"
 MATCH_KEY=email
 DRY_RUN=false
 ```
 
-동기화 결과 Grafana 상태:
+동기화 결과 생성되는 Grafana 팀:
 
-| 팀 | 멤버 | 팀 권한 |
+| Grafana 팀 | 멤버 | 이후 폴더 권한 부여 (Terraform, 범위 밖) |
 |---|---|---|
-| `abc` | alice@example.com | Admin |
-| `abc` | bob@example.com | Member |
-| `abc` | carol@example.com | Member |
-| `xyz` | dave@example.com | Member (팀 그룹 직속 멤버) |
-| `xyz` | alice@example.com | Admin |
-| `legacy` | (없음) | `legacy_ops` 는 스킵, 빈 팀만 생성 |
+| `abc_adm` | alice@example.com | `abc` 폴더에 **Admin** |
+| `abc_editor` | bob@example.com | `abc` 폴더에 **Edit** |
+| `abc_viewer` | carol@example.com | `abc` 폴더에 **View** |
+| `xyz` | dave@example.com | (서비스 그룹 직속 멤버) |
+| `xyz_viewer` | erin@example.com | `xyz` 폴더에 **View** |
 
+- `legacy_ops` 는 `ROLE_SUFFIXES` 에 없는 suffix 라 경고 후 스킵되고,
+  `legacy` 는 직속 멤버가 없으므로 빈 팀을 만들지 않습니다.
 - `hr`/`payroll` 은 prefix 밖이므로 팀이 생성되지 않고, 같은 이름의 기존
   Grafana 팀이 있어도 건드리지 않습니다.
 - carol 이 아직 Grafana 에 로그인한 적이 없다면 이번 주기에는
   `member_pending_first_login` 으로 건너뛰고, 최초 로그인 후 다음 주기에
   자동으로 팀에 편입됩니다.
-- 이후 Keycloak 에서 bob 을 `abc_member` 에서 빼면 다음 주기에 팀 `abc` 에서도
-  제거되고, alice 를 `abc_adm` 에서 `abc_member` 로 옮기면 Admin → Member 로
-  강등됩니다.
+- 이후 Keycloak 에서 bob 을 `abc_editor` 에서 빼면 다음 주기에 팀
+  `abc_editor` 에서도 제거되고, alice 를 `abc_adm` 에서 `abc_viewer` 로
+  옮기면 두 팀의 멤버십이 그에 맞게 갱신됩니다.
 
 `DRY_RUN=true` 로 먼저 실행하면 위 변경이 다음과 같은 로그로만 출력됩니다.
 
 ```
 time=... level=INFO event=dry_run_enabled
-time=... level=INFO event=would_create_team team=abc
-time=... level=INFO event=would_add_member team=abc target=alice@example.com permission=Admin
-time=... level=INFO event=would_add_member team=abc target=bob@example.com permission=Member
-time=... level=INFO event=member_pending_first_login team=abc target=carol@example.com
-time=... level=WARNING event=unknown_permission_group_skipped team=legacy group=legacy_ops expected=legacy_adm|legacy_member
-time=... level=INFO event=sync_complete teams=3 failed_teams=0 added=4 removed=0 permission_updates=0 pending_first_login=1 dry_run=True exit_code=0
+time=... level=WARNING event=unknown_role_group_skipped service=legacy group=legacy_ops expected=legacy_adm|legacy_editor|legacy_viewer
+time=... level=INFO event=would_create_team team=abc_adm
+time=... level=INFO event=would_add_member team=abc_adm target=alice@example.com
+time=... level=INFO event=would_create_team team=abc_editor
+time=... level=INFO event=would_add_member team=abc_editor target=bob@example.com
+time=... level=INFO event=would_create_team team=abc_viewer
+time=... level=INFO event=member_pending_first_login team=abc_viewer target=carol@example.com
+time=... level=INFO event=empty_team_not_created team=legacy
+... (xyz / xyz_viewer 생략)
+time=... level=INFO event=sync_complete teams=7 failed_teams=0 added=4 removed=0 pending_first_login=1 dry_run=True exit_code=0
 ```
 
 ### 범위 밖 (별도 작업)
@@ -142,7 +147,7 @@ time=... level=INFO event=sync_complete teams=3 failed_teams=0 added=4 removed=0
 | `GRAFANA_TOKEN` | Y | | 서비스 계정 토큰 — K8s Secret 으로 주입 |
 | `GROUP_PREFIX` | N | `grafana-` | 루트 그룹 이름 prefix (예: `service`) |
 | `MATCH_KEY` | N | `email` | `email` 또는 `username`. Grafana `login_attribute_path` 와 일치해야 함 |
-| `PERMISSION_MAP` | N | `adm=admin,admin=admin,member=member,mbr=member,mem=member` | 권한 그룹 suffix → 팀 권한 매핑. `<suffix>=<admin\|member>` 콤마 구분 |
+| `ROLE_SUFFIXES` | N | `adm,admin,editor,viewer,member,mbr` | 인식할 역할 그룹 suffix 목록 (콤마 구분) |
 | `DRY_RUN` | N | `true` | 변경 없이 로그만 출력 |
 | `MAX_REMOVAL_RATIO` | N | `0.5` | 팀별 제거 가드 임계값 (0~1) |
 | `LOG_LEVEL` | N | `INFO` | |
@@ -210,9 +215,9 @@ kubectl create secret generic grafana-team-sync \
 한 줄 단위 logfmt 스타일 구조화 로그입니다.
 
 ```
-time=2026-08-27T09:00:01+0000 level=INFO event=add_member team=devs target=alice@example.com permission=Member
-time=2026-08-27T09:00:01+0000 level=INFO event=update_permission team=devs target=bob@example.com permission=Admin
-time=2026-08-27T09:00:02+0000 level=INFO event=sync_complete teams=3 failed_teams=0 added=2 removed=1 permission_updates=1 pending_first_login=1 dry_run=False exit_code=0
+time=2026-08-27T09:00:01+0000 level=INFO event=add_member team=abc_editor target=alice@example.com
+time=2026-08-27T09:00:01+0000 level=INFO event=remove_member team=abc_viewer target=bob@example.com
+time=2026-08-27T09:00:02+0000 level=INFO event=sync_complete teams=6 failed_teams=0 added=1 removed=1 pending_first_login=0 dry_run=False exit_code=0
 ```
 
 ## 개발
@@ -223,5 +228,5 @@ python -m pytest tests/ -v
 ```
 
 테스트는 `responses` 로 Keycloak/Grafana API 를 모킹하며, 팀 생성·멤버 추가/제거,
-권한(admin/member) 하위 그룹과 권한 갱신, 페이지네이션, 제거 가드, dry-run 무변경,
-토큰 재발급 등을 커버합니다.
+역할 그룹의 독립 팀 생성, suffix 인식/스킵, 페이지네이션, 제거 가드,
+dry-run 무변경, 토큰 재발급 등을 커버합니다.

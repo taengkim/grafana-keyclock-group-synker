@@ -2,10 +2,13 @@
 """Sync Keycloak group memberships to Grafana teams.
 
 Groups whose name starts with GROUP_PREFIX are root groups. One depth
-below a root group are the teams; one depth below a team are its
-permission groups, e.g. /service/abc/abc_adm with GROUP_PREFIX=service
-maps to Grafana team "abc" with the members of "abc_adm" as team
-Admins. Direct members of the team group itself are plain Members.
+below a root group are the services; one depth below a service are its
+role groups, each synced as an INDEPENDENT Grafana team, e.g. with
+GROUP_PREFIX=service the tree /service/abc/{abc_adm,abc_editor,
+abc_viewer} yields Grafana teams "abc_adm", "abc_editor" and
+"abc_viewer". Folder permissions (Admin/Edit/View) are granted to
+those teams outside this tool (Terraform or manually). Direct members
+of the service group itself sync to a team named after the service.
 Only team membership is managed here; org roles stay with Grafana's
 role_attribute_path mapping.
 
@@ -20,7 +23,7 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import requests
 
@@ -37,63 +40,32 @@ EXIT_OK = 0
 EXIT_PARTIAL = 1
 EXIT_CONFIG = 2
 
-# Grafana team member permission values
-PERMISSION_MEMBER = 0
-PERMISSION_ADMIN = 4
-PERMISSION_LABELS = {PERMISSION_MEMBER: "Member", PERMISSION_ADMIN: "Admin"}
-# Default permission-group name (after stripping an optional
-# "<team>_"/"<team>-" prefix, e.g. "abc_adm" for team "abc") -> team
-# permission. Overridable via the PERMISSION_MAP environment variable.
-DEFAULT_PERMISSION_MAP = {
-    "admin": PERMISSION_ADMIN,
-    "adm": PERMISSION_ADMIN,
-    "member": PERMISSION_MEMBER,
-    "mbr": PERMISSION_MEMBER,
-    "mem": PERMISSION_MEMBER,
-}
+# Default role-group name suffixes recognized under a service group
+# (e.g. "abc_adm" for service "abc"). Overridable via ROLE_SUFFIXES.
+DEFAULT_ROLE_SUFFIXES = ("adm", "admin", "editor", "viewer", "member", "mbr")
 
 
-def parse_permission_map(raw: str) -> dict[str, int]:
-    """Parse PERMISSION_MAP: comma-separated "<suffix>=<admin|member>" pairs.
-
-    Example: "adm=admin,mgr=admin,dev=member"
-    """
-    mapping: dict[str, int] = {}
-    for pair in raw.split(","):
-        pair = pair.strip()
-        if not pair:
-            continue
-        if "=" not in pair:
-            raise ConfigError(f"PERMISSION_MAP entry {pair!r} must be '<suffix>=<admin|member>'")
-        suffix, _, permission = pair.partition("=")
-        suffix = suffix.strip().lower()
-        permission = permission.strip().lower()
-        if not suffix:
-            raise ConfigError(f"PERMISSION_MAP entry {pair!r} has an empty group-name suffix")
-        if permission not in ("admin", "member"):
-            raise ConfigError(
-                f"PERMISSION_MAP entry {pair!r}: permission must be 'admin' or 'member', got {permission!r}"
-            )
-        mapping[suffix] = PERMISSION_ADMIN if permission == "admin" else PERMISSION_MEMBER
-    if not mapping:
-        raise ConfigError("PERMISSION_MAP must contain at least one '<suffix>=<admin|member>' pair")
-    return mapping
+def parse_role_suffixes(raw: str) -> frozenset[str]:
+    """Parse ROLE_SUFFIXES: comma-separated suffixes, e.g. "adm,editor,viewer"."""
+    suffixes = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    if not suffixes:
+        raise ConfigError("ROLE_SUFFIXES must contain at least one suffix")
+    return frozenset(suffixes)
 
 
-def child_permission(team_name: str, child_name: str, permission_map: dict[str, int]) -> int | None:
-    """Team permission encoded in a permission-group name, or None.
+def is_role_group(service_name: str, child_name: str, role_suffixes: frozenset[str]) -> bool:
+    """Whether a service sub-group is a recognized role group.
 
-    Matches the mapped name as "<team>_<name>", "<team>-<name>", or bare
-    "<name>" (e.g. "abc_adm", "abc-adm", "adm"), case-insensitive.
+    Matches "<service>_<suffix>" or "<service>-<suffix>" with a suffix
+    from role_suffixes, case-insensitive (e.g. "abc_adm", "abc-viewer").
     """
     name = child_name.strip().lower()
-    team = team_name.strip().lower()
+    service = service_name.strip().lower()
     for separator in ("_", "-"):
-        prefixed = f"{team}{separator}"
+        prefixed = f"{service}{separator}"
         if name.startswith(prefixed):
-            name = name[len(prefixed):]
-            break
-    return permission_map.get(name)
+            return name[len(prefixed):] in role_suffixes
+    return False
 
 RETRYABLE_EXCEPTIONS = (
     requests.exceptions.ConnectionError,
@@ -162,7 +134,7 @@ class Config:
     dry_run: bool = True
     max_removal_ratio: float = 0.5
     log_level: str = "INFO"
-    permission_map: dict = field(default_factory=lambda: dict(DEFAULT_PERMISSION_MAP))
+    role_suffixes: frozenset = frozenset(DEFAULT_ROLE_SUFFIXES)
 
     REQUIRED = (
         "KEYCLOAK_URL",
@@ -195,8 +167,8 @@ class Config:
         if not 0.0 <= max_removal_ratio <= 1.0:
             raise ConfigError(f"MAX_REMOVAL_RATIO must be between 0 and 1, got {raw_ratio!r}")
 
-        raw_permission_map = env.get("PERMISSION_MAP", "")
-        permission_map = parse_permission_map(raw_permission_map) if raw_permission_map.strip() else dict(DEFAULT_PERMISSION_MAP)
+        raw_role_suffixes = env.get("ROLE_SUFFIXES", "")
+        role_suffixes = parse_role_suffixes(raw_role_suffixes) if raw_role_suffixes.strip() else frozenset(DEFAULT_ROLE_SUFFIXES)
 
         return cls(
             keycloak_url=env["KEYCLOAK_URL"].rstrip("/"),
@@ -210,7 +182,7 @@ class Config:
             dry_run=parse_bool(env.get("DRY_RUN", "true"), "DRY_RUN"),
             max_removal_ratio=max_removal_ratio,
             log_level=env.get("LOG_LEVEL", "INFO"),
-            permission_map=permission_map,
+            role_suffixes=role_suffixes,
         )
 
 
@@ -417,18 +389,10 @@ class GrafanaClient:
             raise ApiError(f"grafana user lookup failed with status {resp.status_code}", status=resp.status_code)
         return resp.json()
 
-    def add_team_member(self, team_id: int, user_id: int, permission: int = PERMISSION_MEMBER) -> None:
-        payload = {"userId": user_id}
-        if permission != PERMISSION_MEMBER:
-            payload["permission"] = permission
-        resp = self._request("POST", f"/api/teams/{team_id}/members", json=payload)
+    def add_team_member(self, team_id: int, user_id: int) -> None:
+        resp = self._request("POST", f"/api/teams/{team_id}/members", json={"userId": user_id})
         if resp.status_code != 200:
             raise ApiError(f"grafana add member failed with status {resp.status_code}", status=resp.status_code)
-
-    def set_team_member_permission(self, team_id: int, user_id: int, permission: int) -> None:
-        resp = self._request("PUT", f"/api/teams/{team_id}/members/{user_id}", json={"permission": permission})
-        if resp.status_code != 200:
-            raise ApiError(f"grafana set member permission failed with status {resp.status_code}", status=resp.status_code)
 
     def remove_team_member(self, team_id: int, user_id: int) -> None:
         resp = self._request("DELETE", f"/api/teams/{team_id}/members/{user_id}")
@@ -440,21 +404,14 @@ class GrafanaClient:
 class TeamResult:
     added: int = 0
     removed: int = 0
-    permission_updated: int = 0
     pending: int = 0
     guard_triggered: bool = False
 
 
-def desired_members(cfg: Config, kc: KeycloakClient, team_name: str, groups: list[dict]) -> dict[str, int]:
-    """Desired team membership as {match key: team permission}.
-
-    Direct members of the team group get Member; members of a permission
-    sub-group (e.g. "<team>_adm") get that permission (admin wins on
-    conflict).
-    """
-    desired: dict[str, int] = {}
-
-    def ingest(group: dict, permission: int) -> None:
+def desired_members(cfg: Config, kc: KeycloakClient, team_name: str, groups: list[dict]) -> set[str]:
+    """Desired team membership: match keys of the groups' direct members."""
+    desired: set[str] = set()
+    for group in groups:
         for user in kc.get_group_members(group["id"]):
             if not user.get("enabled", True):
                 continue
@@ -466,21 +423,7 @@ def desired_members(cfg: Config, kc: KeycloakClient, team_name: str, groups: lis
                     target=user.get("username") or user.get("id") or "unknown",
                 )
                 continue
-            key = raw.strip().lower()
-            desired[key] = max(desired.get(key, PERMISSION_MEMBER), permission)
-
-    for team_group in groups:
-        ingest(team_group, PERMISSION_MEMBER)
-        for child in kc.get_children(team_group):
-            permission = child_permission(team_name, child.get("name", ""), cfg.permission_map)
-            if permission is None:
-                log_event(
-                    logging.WARNING, "unknown_permission_group_skipped",
-                    team=team_name, group=child.get("name", ""),
-                    expected="|".join(f"{team_name}_{suffix}" for suffix in sorted(cfg.permission_map)),
-                )
-                continue
-            ingest(child, permission)
+            desired.add(raw.strip().lower())
     return desired
 
 
@@ -497,6 +440,11 @@ def sync_team(cfg: Config, kc: KeycloakClient, gf: GrafanaClient, team_name: str
     team_id: int | None = None
     current_members: list[dict] = []
     if team is None:
+        if not desired:
+            # Avoid littering empty teams, e.g. a service group whose
+            # members all live in its role sub-groups.
+            log_event(logging.INFO, "empty_team_not_created", team=team_name)
+            return result
         if cfg.dry_run:
             log_event(logging.INFO, "would_create_team", team=team_name)
         else:
@@ -512,12 +460,8 @@ def sync_team(cfg: Config, kc: KeycloakClient, gf: GrafanaClient, team_name: str
         if key:
             current_by_key[key] = member
 
-    to_add = sorted(set(desired) - set(current_by_key))
-    to_remove = sorted(set(current_by_key) - set(desired))
-    to_update = sorted(
-        key for key in set(desired) & set(current_by_key)
-        if int(current_by_key[key].get("permission") or PERMISSION_MEMBER) != desired[key]
-    )
+    to_add = sorted(desired - set(current_by_key))
+    to_remove = sorted(set(current_by_key) - desired)
 
     if to_remove and current_members and (len(to_remove) / len(current_members)) > cfg.max_removal_ratio:
         log_event(
@@ -529,32 +473,17 @@ def sync_team(cfg: Config, kc: KeycloakClient, gf: GrafanaClient, team_name: str
         to_remove = []
 
     for key in to_add:
-        permission = desired[key]
-        label = PERMISSION_LABELS[permission]
         user = gf.lookup_user(key)
         if user is None:
             result.pending += 1
             log_event(logging.INFO, "member_pending_first_login", team=team_name, target=key)
             continue
         if cfg.dry_run:
-            log_event(logging.INFO, "would_add_member", team=team_name, target=key, permission=label)
+            log_event(logging.INFO, "would_add_member", team=team_name, target=key)
         else:
-            log_event(logging.INFO, "add_member", team=team_name, target=key, permission=label)
-            gf.add_team_member(team_id, user["id"], permission)
-            if permission != PERMISSION_MEMBER:
-                # Older Grafana ignores "permission" in the add payload
-                gf.set_team_member_permission(team_id, user["id"], permission)
+            log_event(logging.INFO, "add_member", team=team_name, target=key)
+            gf.add_team_member(team_id, user["id"])
         result.added += 1
-
-    for key in to_update:
-        member = current_by_key[key]
-        label = PERMISSION_LABELS[desired[key]]
-        if cfg.dry_run:
-            log_event(logging.INFO, "would_update_permission", team=team_name, target=key, permission=label)
-        else:
-            log_event(logging.INFO, "update_permission", team=team_name, target=key, permission=label)
-            gf.set_team_member_permission(team_id, member["userId"], desired[key])
-        result.permission_updated += 1
 
     for key in to_remove:
         member = current_by_key[key]
@@ -568,7 +497,6 @@ def sync_team(cfg: Config, kc: KeycloakClient, gf: GrafanaClient, team_name: str
     log_event(
         logging.INFO, "team_synced",
         team=team_name, added=result.added, removed=result.removed,
-        permission_updates=result.permission_updated,
         pending=result.pending, dry_run=cfg.dry_run,
     )
     return result
@@ -583,16 +511,28 @@ def run_sync(cfg: Config, kc: KeycloakClient | None = None, gf: GrafanaClient | 
 
     roots = kc.collect_root_groups(cfg.group_prefix)
 
-    # Teams are the children of a root group; same-named teams under
-    # multiple roots are merged. Each team group's children are its
-    # permission groups.
+    # Children of a root group are services; each service's role
+    # sub-groups (e.g. abc_adm, abc_editor, abc_viewer) are independent
+    # teams named after the role group. Direct members of the service
+    # group sync to a team named after the service. Same-named teams are
+    # merged.
     teams: dict[str, list[dict]] = {}
     for root in roots:
-        for team_group in kc.get_children(root):
-            team_name = team_group.get("name", "").strip()
-            if not team_name:
+        for service_group in kc.get_children(root):
+            service_name = service_group.get("name", "").strip()
+            if not service_name:
                 continue
-            teams.setdefault(team_name, []).append(team_group)
+            teams.setdefault(service_name, []).append(service_group)
+            for child in kc.get_children(service_group):
+                child_name = child.get("name", "").strip()
+                if not is_role_group(service_name, child_name, cfg.role_suffixes):
+                    log_event(
+                        logging.WARNING, "unknown_role_group_skipped",
+                        service=service_name, group=child_name,
+                        expected="|".join(f"{service_name}_{suffix}" for suffix in sorted(cfg.role_suffixes)),
+                    )
+                    continue
+                teams.setdefault(child_name, []).append(child)
 
     if not teams:
         log_event(
@@ -615,7 +555,6 @@ def run_sync(cfg: Config, kc: KeycloakClient | None = None, gf: GrafanaClient | 
             continue
         total.added += result.added
         total.removed += result.removed
-        total.permission_updated += result.permission_updated
         total.pending += result.pending
         if result.guard_triggered:
             exit_code = EXIT_PARTIAL
@@ -624,7 +563,6 @@ def run_sync(cfg: Config, kc: KeycloakClient | None = None, gf: GrafanaClient | 
         logging.INFO, "sync_complete",
         teams=len(teams), failed_teams=failed_teams,
         added=total.added, removed=total.removed,
-        permission_updates=total.permission_updated,
         pending_first_login=total.pending, dry_run=cfg.dry_run, exit_code=exit_code,
     )
     return exit_code
