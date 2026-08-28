@@ -1,10 +1,11 @@
 """Unit tests for sync.py with all external HTTP calls mocked via `responses`.
 
-Group model under test: /service/<team>/<team>_adm
+Group model under test: /service/<svc>/<svc>_<role>
   - "service" (matches GROUP_PREFIX) is the root group
-  - depth 1 below the root = team name
-  - depth 2 = permission group ("<team>_adm" -> team Admin,
-    "<team>_member" -> Member); direct team-group members are Members
+  - depth 1 below the root = service (direct members -> team "<svc>")
+  - depth 2 = role groups ("abc_adm", "abc_editor", "abc_viewer"), each
+    synced as an independent Grafana team named after the role group;
+    folder permissions are granted to those teams outside this tool
 """
 import json
 import logging
@@ -60,24 +61,24 @@ def kc_user(email, username=None, enabled=True):
     return {"id": f"kc-{username}", "username": username, "email": email, "enabled": enabled}
 
 
-def gf_member(user_id, email, login=None, permission=0):
-    return {"userId": user_id, "email": email, "login": login or email.split("@")[0], "permission": permission}
+def gf_member(user_id, email, login=None):
+    return {"userId": user_id, "email": email, "login": login or email.split("@")[0]}
 
 
 def add_token_endpoint():
     responses.add(responses.POST, TOKEN_URL, json={"access_token": "kc-token", "expires_in": 60})
 
 
-def add_tree(team_groups, empty_team_children=True):
-    """Register the root group listing and its team children.
+def add_tree(service_groups, empty_children=True):
+    """Register the root group listing and its service children.
 
-    With empty_team_children, each team group gets an empty permission
-    child list; tests that need permission groups register their own.
+    With empty_children, each service group gets an empty role-group
+    list; tests that need role groups register their own.
     """
     responses.add(responses.GET, f"{ADMIN}/groups", json=[ROOT])
-    responses.add(responses.GET, f"{ADMIN}/groups/{ROOT['id']}/children", json=team_groups)
-    if empty_team_children:
-        for group in team_groups:
+    responses.add(responses.GET, f"{ADMIN}/groups/{ROOT['id']}/children", json=service_groups)
+    if empty_children:
+        for group in service_groups:
             responses.add(responses.GET, f"{ADMIN}/groups/{group['id']}/children", json=[])
 
 
@@ -121,6 +122,14 @@ def grafana_write_calls():
     return [c for c in write_calls() if c.request.url.startswith(GF)]
 
 
+def created_team_names():
+    return [
+        json.loads(c.request.body)["name"]
+        for c in responses.calls
+        if c.request.method == "POST" and c.request.url == f"{GF}/api/teams"
+    ]
+
+
 @responses.activate
 def test_creates_new_team_and_adds_members():
     add_token_endpoint()
@@ -134,6 +143,102 @@ def test_creates_new_team_and_adds_members():
 
     assert sync.run_sync(make_config()) == 0
     assert added.call_count == 2
+
+
+@responses.activate
+def test_role_groups_become_independent_teams():
+    """/service/abc/{abc_adm,abc_editor,abc_viewer} -> three role teams."""
+    add_token_endpoint()
+    add_tree([{"id": "g1", "name": "abc"}], empty_children=False)
+    add_children("g1", [
+        {"id": "g2", "name": "abc_adm"},
+        {"id": "g3", "name": "abc_editor"},
+        {"id": "g4", "name": "abc_viewer"},
+    ])
+    add_members("g1", [])  # nobody directly in the service group
+    add_members("g2", [kc_user("alice@example.com")])
+    add_members("g3", [kc_user("bob@example.com")])
+    add_members("g4", [kc_user("carol@example.com")])
+    add_team_search("abc")
+    add_team_search("abc_adm")
+    add_team_search("abc_editor")
+    add_team_search("abc_viewer")
+    responses.add(responses.POST, f"{GF}/api/teams", json={"teamId": 7, "message": "Team created"})
+    add_lookup("alice@example.com", user_id=101)
+    add_lookup("bob@example.com", user_id=102)
+    add_lookup("carol@example.com", user_id=103)
+    responses.add(responses.POST, f"{GF}/api/teams/7/members", json={"message": "Member added"})
+
+    assert sync.run_sync(make_config()) == 0
+    # The empty "abc" service team is not created; the three role teams are
+    assert sorted(created_team_names()) == ["abc_adm", "abc_editor", "abc_viewer"]
+
+
+@responses.activate
+def test_service_direct_members_sync_to_service_team():
+    add_token_endpoint()
+    add_tree([{"id": "g1", "name": "abc"}], empty_children=False)
+    add_children("g1", [{"id": "g2", "name": "abc_viewer"}])
+    add_members("g1", [kc_user("dave@example.com")])
+    add_members("g2", [kc_user("erin@example.com")])
+    add_team_search("abc", {"id": 7, "name": "abc"})
+    add_team_search("abc_viewer", {"id": 8, "name": "abc_viewer"})
+    responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[gf_member(104, "dave@example.com")])
+    responses.add(responses.GET, f"{GF}/api/teams/8/members", json=[gf_member(105, "erin@example.com")])
+
+    assert sync.run_sync(make_config()) == 0
+    assert not grafana_write_calls()
+
+
+@responses.activate
+def test_empty_service_team_is_not_created(caplog):
+    add_token_endpoint()
+    add_tree([{"id": "g1", "name": "abc"}], empty_children=False)
+    add_children("g1", [{"id": "g2", "name": "abc_adm"}])
+    add_members("g1", [])
+    add_members("g2", [kc_user("alice@example.com")])
+    add_team_search("abc")      # does not exist and has no desired members
+    add_team_search("abc_adm", {"id": 8, "name": "abc_adm"})
+    responses.add(responses.GET, f"{GF}/api/teams/8/members", json=[gf_member(101, "alice@example.com")])
+
+    assert sync.run_sync(make_config()) == 0
+    assert not grafana_write_calls()
+    assert "empty_team_not_created" in caplog.text
+
+
+@responses.activate
+def test_unknown_role_group_is_skipped(caplog):
+    add_token_endpoint()
+    add_tree([{"id": "g1", "name": "devs"}], empty_children=False)
+    add_children("g1", [{"id": "g2", "name": "devs_leads"}, {"id": "g3", "name": "other_adm"}])
+    add_members("g1", [kc_user("alice@example.com")])
+    add_team_search("devs", {"id": 7, "name": "devs"})
+    responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[gf_member(101, "alice@example.com")])
+
+    assert sync.run_sync(make_config()) == 0
+    assert "unknown_role_group_skipped" in caplog.text
+    # Members of unknown role groups were never even fetched
+    assert not [c for c in responses.calls if "/groups/g2/members" in c.request.url]
+    assert not [c for c in responses.calls if "/groups/g3/members" in c.request.url]
+    assert not grafana_write_calls()
+
+
+@responses.activate
+def test_custom_role_suffixes():
+    add_token_endpoint()
+    add_tree([{"id": "g1", "name": "abc"}], empty_children=False)
+    add_children("g1", [{"id": "g2", "name": "abc_ops"}])
+    add_members("g1", [])
+    add_members("g2", [kc_user("alice@example.com")])
+    add_team_search("abc")
+    add_team_search("abc_ops")
+    created = responses.add(responses.POST, f"{GF}/api/teams", json={"teamId": 7, "message": "Team created"})
+    add_lookup("alice@example.com", user_id=101)
+    responses.add(responses.POST, f"{GF}/api/teams/7/members", json={"message": "Member added"})
+
+    assert sync.run_sync(make_config(role_suffixes=frozenset({"ops"}))) == 0
+    assert created.call_count == 1
+    assert created_team_names() == ["abc_ops"]
 
 
 @responses.activate
@@ -201,7 +306,7 @@ def test_no_root_group_changes_nothing(caplog):
 
 
 @responses.activate
-def test_root_without_teams_changes_nothing(caplog):
+def test_root_without_services_changes_nothing(caplog):
     add_token_endpoint()
     add_tree([])
 
@@ -240,95 +345,6 @@ def test_removal_ratio_guard_skips_team_and_exits_1(caplog):
 
 
 @responses.activate
-def test_adm_suffix_subgroup_grants_team_admin():
-    """/service/abc/abc_adm -> team "abc" with abc_adm members as Admin."""
-    add_token_endpoint()
-    add_tree([{"id": "g1", "name": "abc"}], empty_team_children=False)
-    add_children("g1", [{"id": "g2", "name": "abc_adm"}])
-    add_members("g1", [kc_user("alice@example.com")])  # direct member -> Member
-    add_members("g2", [kc_user("bob@example.com")])    # abc_adm -> Admin
-    add_team_search("abc")
-    responses.add(responses.POST, f"{GF}/api/teams", json={"teamId": 7, "message": "Team created"})
-    add_lookup("alice@example.com", user_id=101)
-    add_lookup("bob@example.com", user_id=102)
-    added = responses.add(responses.POST, f"{GF}/api/teams/7/members", json={"message": "Member added"})
-    perm_put = responses.add(responses.PUT, f"{GF}/api/teams/7/members/102", json={"message": "Permission updated"})
-
-    assert sync.run_sync(make_config()) == 0
-    assert added.call_count == 2
-    bodies = [json.loads(c.request.body) for c in responses.calls
-              if c.request.method == "POST" and c.request.url == f"{GF}/api/teams/7/members"]
-    assert {"userId": 101} in bodies
-    assert {"userId": 102, "permission": 4} in bodies
-    # Admin permission also enforced via PUT for older Grafana versions
-    assert perm_put.call_count == 1
-    assert json.loads(perm_put.calls[0].request.body) == {"permission": 4}
-
-
-@responses.activate
-def test_permission_change_of_existing_members():
-    add_token_endpoint()
-    add_tree([{"id": "g1", "name": "devs"}], empty_team_children=False)
-    add_children("g1", [{"id": "g2", "name": "devs_member"}, {"id": "g3", "name": "devs_adm"}])
-    add_members("g1", [])
-    add_members("g2", [kc_user("bob@example.com")])    # demoted: was Admin in Grafana
-    add_members("g3", [kc_user("alice@example.com")])  # promoted: was Member in Grafana
-    add_team_search("devs", {"id": 7, "name": "devs"})
-    responses.add(
-        responses.GET, f"{GF}/api/teams/7/members",
-        json=[
-            gf_member(101, "alice@example.com", permission=0),
-            gf_member(102, "bob@example.com", permission=4),
-        ],
-    )
-    put_alice = responses.add(responses.PUT, f"{GF}/api/teams/7/members/101", json={"message": "Permission updated"})
-    put_bob = responses.add(responses.PUT, f"{GF}/api/teams/7/members/102", json={"message": "Permission updated"})
-
-    assert sync.run_sync(make_config()) == 0
-    assert put_alice.call_count == 1
-    assert json.loads(put_alice.calls[0].request.body) == {"permission": 4}
-    assert put_bob.call_count == 1
-    assert json.loads(put_bob.calls[0].request.body) == {"permission": 0}
-    # No adds or removals, only permission updates
-    assert not [c for c in responses.calls if c.request.method == "DELETE"]
-    assert not [c for c in responses.calls if c.request.method == "POST" and c.request.url.startswith(f"{GF}/api/teams")]
-
-
-@responses.activate
-def test_admin_wins_when_user_in_both_permission_groups():
-    add_token_endpoint()
-    add_tree([{"id": "g1", "name": "devs"}], empty_team_children=False)
-    add_children("g1", [{"id": "g2", "name": "devs_member"}, {"id": "g3", "name": "devs_adm"}])
-    add_members("g1", [kc_user("alice@example.com")])
-    add_members("g2", [kc_user("alice@example.com")])
-    add_members("g3", [kc_user("alice@example.com")])
-    add_team_search("devs", {"id": 7, "name": "devs"})
-    responses.add(
-        responses.GET, f"{GF}/api/teams/7/members",
-        json=[gf_member(101, "alice@example.com", permission=4)],
-    )
-
-    assert sync.run_sync(make_config()) == 0
-    assert not grafana_write_calls()
-
-
-@responses.activate
-def test_unknown_permission_subgroup_is_skipped(caplog):
-    add_token_endpoint()
-    add_tree([{"id": "g1", "name": "devs"}], empty_team_children=False)
-    add_children("g1", [{"id": "g2", "name": "devs_leads"}])
-    add_members("g1", [kc_user("alice@example.com")])
-    add_team_search("devs", {"id": 7, "name": "devs"})
-    responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[gf_member(101, "alice@example.com")])
-
-    assert sync.run_sync(make_config()) == 0
-    assert "unknown_permission_group_skipped" in caplog.text
-    # Members of the unknown sub-group were never even fetched
-    assert not [c for c in responses.calls if "/groups/g2/members" in c.request.url]
-    assert not grafana_write_calls()
-
-
-@responses.activate
 def test_subgroups_fallback_for_old_keycloak():
     add_token_endpoint()
     responses.add(
@@ -346,13 +362,9 @@ def test_subgroups_fallback_for_old_keycloak():
     add_members("g1", [kc_user("alice@example.com")])
     add_members("g2", [kc_user("bob@example.com")])
     add_team_search("devs", {"id": 7, "name": "devs"})
-    responses.add(
-        responses.GET, f"{GF}/api/teams/7/members",
-        json=[
-            gf_member(101, "alice@example.com", permission=0),
-            gf_member(102, "bob@example.com", permission=4),
-        ],
-    )
+    add_team_search("devs_adm", {"id": 8, "name": "devs_adm"})
+    responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[gf_member(101, "alice@example.com")])
+    responses.add(responses.GET, f"{GF}/api/teams/8/members", json=[gf_member(102, "bob@example.com")])
 
     assert sync.run_sync(make_config()) == 0
     assert not grafana_write_calls()
@@ -388,16 +400,15 @@ def test_member_pagination_over_multiple_pages():
 @responses.activate
 def test_dry_run_makes_no_write_calls(caplog):
     add_token_endpoint()
-    add_tree([{"id": "g1", "name": "devs"}, {"id": "g2", "name": "new"}], empty_team_children=False)
-    add_children("g1", [{"id": "g3", "name": "devs_adm"}])
+    add_tree([{"id": "g1", "name": "devs"}, {"id": "g2", "name": "new"}], empty_children=False)
+    add_children("g1", [])
     add_children("g2", [])
     add_members("g1", [kc_user("carol@example.com")])
-    add_members("g3", [kc_user("bob@example.com")])  # bob would be promoted to Admin
     add_members("g2", [kc_user("alice@example.com")])
     add_team_search("devs", {"id": 7, "name": "devs"})
     responses.add(
         responses.GET, f"{GF}/api/teams/7/members",
-        json=[gf_member(102, "bob@example.com", permission=0), gf_member(101, "old@example.com")],
+        json=[gf_member(102, "bob@example.com"), gf_member(101, "old@example.com")],
     )
     add_team_search("new")  # would need to be created
     add_lookup("carol@example.com", user_id=103)
@@ -407,7 +418,6 @@ def test_dry_run_makes_no_write_calls(caplog):
     assert not grafana_write_calls()
     assert "would_create_team" in caplog.text
     assert "would_add_member" in caplog.text
-    assert "would_update_permission" in caplog.text
     assert "would_remove_member" in caplog.text
 
 
@@ -458,7 +468,7 @@ def test_match_key_username_uses_login_and_is_case_insensitive():
     add_tree([{"id": "g1", "name": "devs"}])
     add_members("g1", [kc_user("alice@example.com", username="Alice")])
     add_team_search("devs", {"id": 7, "name": "devs"})
-    responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[{"userId": 101, "email": "other@example.com", "login": "alice", "permission": 0}])
+    responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[{"userId": 101, "email": "other@example.com", "login": "alice"}])
 
     assert sync.run_sync(make_config(match_key="username")) == 0
     assert not grafana_write_calls()
@@ -510,6 +520,25 @@ def test_config_defaults_dry_run_true():
     assert cfg.group_prefix == "grafana-"
     assert cfg.match_key == "email"
     assert cfg.max_removal_ratio == 0.5
+    assert cfg.role_suffixes == frozenset(sync.DEFAULT_ROLE_SUFFIXES)
+
+
+def test_config_parses_role_suffixes():
+    cfg = sync.Config.from_env({
+        "KEYCLOAK_URL": KC,
+        "KEYCLOAK_REALM": REALM,
+        "KEYCLOAK_CLIENT_ID": "grafana-sync",
+        "KEYCLOAK_CLIENT_SECRET": "secret",
+        "GRAFANA_URL": GF,
+        "GRAFANA_TOKEN": "gf-token",
+        "ROLE_SUFFIXES": "adm, Editor ,viewer",
+    })
+    assert cfg.role_suffixes == frozenset({"adm", "editor", "viewer"})
+
+
+def test_config_invalid_role_suffixes():
+    with pytest.raises(sync.ConfigError):
+        sync.parse_role_suffixes("  ,  ")
 
 
 def test_config_invalid_match_key():
@@ -525,85 +554,23 @@ def test_config_invalid_match_key():
         })
 
 
-@pytest.mark.parametrize("team,child,expected", [
-    ("abc", "abc_adm", sync.PERMISSION_ADMIN),
-    ("abc", "abc_admin", sync.PERMISSION_ADMIN),
-    ("abc", "abc-adm", sync.PERMISSION_ADMIN),
-    ("abc", "abc_member", sync.PERMISSION_MEMBER),
-    ("abc", "abc_mbr", sync.PERMISSION_MEMBER),
-    ("abc", "admin", sync.PERMISSION_ADMIN),
-    ("abc", "member", sync.PERMISSION_MEMBER),
-    ("abc", "ABC_ADM", sync.PERMISSION_ADMIN),
-    ("abc", "abc_leads", None),
-    ("abc", "xyz_adm", None),
+SUFFIXES = frozenset(sync.DEFAULT_ROLE_SUFFIXES)
+
+
+@pytest.mark.parametrize("service,child,expected", [
+    ("abc", "abc_adm", True),
+    ("abc", "abc_admin", True),
+    ("abc", "abc_editor", True),
+    ("abc", "abc_viewer", True),
+    ("abc", "abc-viewer", True),
+    ("abc", "ABC_ADM", True),
+    ("abc", "abc_leads", False),
+    ("abc", "xyz_adm", False),   # different service name
+    ("abc", "adm", False),       # bare suffix without service prefix
+    ("abc", "abc", False),
 ])
-def test_child_permission_parsing(team, child, expected):
-    assert sync.child_permission(team, child, sync.DEFAULT_PERMISSION_MAP) == expected
-
-
-@responses.activate
-def test_custom_permission_map():
-    """PERMISSION_MAP lets users map their own suffixes, e.g. abc_mgr -> Admin."""
-    add_token_endpoint()
-    add_tree([{"id": "g1", "name": "abc"}], empty_team_children=False)
-    add_children("g1", [{"id": "g2", "name": "abc_mgr"}, {"id": "g3", "name": "abc_dev"}])
-    add_members("g1", [])
-    add_members("g2", [kc_user("alice@example.com")])  # abc_mgr -> Admin
-    add_members("g3", [kc_user("bob@example.com")])    # abc_dev -> Member
-    add_team_search("abc", {"id": 7, "name": "abc"})
-    responses.add(responses.GET, f"{GF}/api/teams/7/members", json=[])
-    add_lookup("alice@example.com", user_id=101)
-    add_lookup("bob@example.com", user_id=102)
-    added = responses.add(responses.POST, f"{GF}/api/teams/7/members", json={"message": "Member added"})
-    responses.add(responses.PUT, f"{GF}/api/teams/7/members/101", json={"message": "Permission updated"})
-
-    cfg = make_config(permission_map={"mgr": sync.PERMISSION_ADMIN, "dev": sync.PERMISSION_MEMBER})
-    assert sync.run_sync(cfg) == 0
-    bodies = [json.loads(c.request.body) for c in responses.calls
-              if c.request.method == "POST" and c.request.url == f"{GF}/api/teams/7/members"]
-    assert {"userId": 101, "permission": 4} in bodies
-    assert {"userId": 102} in bodies
-    assert added.call_count == 2
-
-
-def test_config_parses_permission_map():
-    cfg = sync.Config.from_env({
-        "KEYCLOAK_URL": KC,
-        "KEYCLOAK_REALM": REALM,
-        "KEYCLOAK_CLIENT_ID": "grafana-sync",
-        "KEYCLOAK_CLIENT_SECRET": "secret",
-        "GRAFANA_URL": GF,
-        "GRAFANA_TOKEN": "gf-token",
-        "PERMISSION_MAP": "adm=admin, MGR = Admin ,dev=member",
-    })
-    assert cfg.permission_map == {
-        "adm": sync.PERMISSION_ADMIN,
-        "mgr": sync.PERMISSION_ADMIN,
-        "dev": sync.PERMISSION_MEMBER,
-    }
-
-
-def test_config_permission_map_defaults_when_unset():
-    cfg = sync.Config.from_env({
-        "KEYCLOAK_URL": KC,
-        "KEYCLOAK_REALM": REALM,
-        "KEYCLOAK_CLIENT_ID": "grafana-sync",
-        "KEYCLOAK_CLIENT_SECRET": "secret",
-        "GRAFANA_URL": GF,
-        "GRAFANA_TOKEN": "gf-token",
-    })
-    assert cfg.permission_map == sync.DEFAULT_PERMISSION_MAP
-
-
-@pytest.mark.parametrize("raw", [
-    "adm=root",       # unknown permission value
-    "adm",            # missing '='
-    "=admin",         # empty suffix
-    "   ,  ",         # no pairs at all
-])
-def test_config_invalid_permission_map(raw):
-    with pytest.raises(sync.ConfigError):
-        sync.parse_permission_map(raw)
+def test_is_role_group(service, child, expected):
+    assert sync.is_role_group(service, child, SUFFIXES) is expected
 
 
 @responses.activate
